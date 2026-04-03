@@ -23,3 +23,7 @@ assets/shared
 .cursorrules
 .env
 context/
+
+# Custom signing
+sign.sh
+web-ext-artifacts/

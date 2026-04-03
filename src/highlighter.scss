@@ -127,15 +127,27 @@ body.obsidian-highlighter-active {
 
 	// Disable pinch zoom on mobile
 	touch-action: pan-x pan-y;
-	cursor: crosshair;
+	// Highlighter pen cursor: right-handed (tip bottom-right), mirrored via scale
+	// Resting state: 45deg tilt, tip at ~(9, 23)
+	cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cg transform='translate(16,16) scale(-1,1) translate(-16,-16) rotate(-45 16 16)'%3E%3Crect x='12' y='4' width='8' height='16' rx='1' fill='%23FFEB00' stroke='%23333' stroke-width='1.5'/%3E%3Crect x='12' y='4' width='8' height='5' rx='1' fill='%23333'/%3E%3Cpath d='M12 20 L16 26 L20 20 Z' fill='%23555'/%3E%3C/g%3E%3C/svg%3E") 9 23, crosshair;
 	a {
-		cursor: crosshair !important;
+		cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cg transform='translate(16,16) scale(-1,1) translate(-16,-16) rotate(-45 16 16)'%3E%3Crect x='12' y='4' width='8' height='16' rx='1' fill='%23FFEB00' stroke='%23333' stroke-width='1.5'/%3E%3Crect x='12' y='4' width='8' height='5' rx='1' fill='%23333'/%3E%3Cpath d='M12 20 L16 26 L20 20 Z' fill='%23555'/%3E%3C/g%3E%3C/svg%3E") 9 23, crosshair !important;
+	}
+	// Pressing state: slightly more upright, tip at ~(10, 24)
+	&:active, &:active a {
+		cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cg transform='translate(16,16) scale(-1,1) translate(-16,-16) rotate(-35 16 16)'%3E%3Crect x='12' y='4' width='8' height='16' rx='1' fill='%23FFEB00' stroke='%23333' stroke-width='1.5'/%3E%3Crect x='12' y='4' width='8' height='5' rx='1' fill='%23333'/%3E%3Cpath d='M12 20 L16 26 L20 20 Z' fill='%23555'/%3E%3C/g%3E%3C/svg%3E") 10 24, crosshair !important;
 	}
 	*::selection {
-		background-color: rgba(255, 235, 0, 0.35) !important;
+		background-color: transparent !important;
+		color: inherit !important;
 	}
+	.obsidian-selection-preview {
+		background-color: rgba(255, 235, 0, 0.15);
+		border-bottom: 3px solid rgba(200, 170, 0, 0.85);
+	}
+	// Eraser cursor on existing highlights — tilted like the pen, tip at ~(9, 23)
 	.obsidian-highlight-overlay {
-		cursor: pointer;
+		cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cg transform='translate(16,16) scale(-1,1) translate(-16,-16) rotate(-45 16 16)'%3E%3Crect x='12' y='4' width='8' height='16' rx='1' fill='%23f5f5f5' stroke='%23555' stroke-width='1.5'/%3E%3Crect x='12' y='4' width='8' height='5' rx='1' fill='%23555'/%3E%3Crect x='12' y='18' width='8' height='4' rx='1' fill='%23e0a0a0' stroke='%23555' stroke-width='1'/%3E%3C/g%3E%3C/svg%3E") 9 23, pointer !important;
 		pointer-events: auto;
 	}
 }
@@ -261,9 +273,9 @@ body.obsidian-highlighter-active {
 .obsidian-highlight-overlay {
 	display: none;
 	position: absolute;
-	background-color: rgba(255, 235, 0, 0.35);
-	border-radius: 4px;
-	mix-blend-mode: multiply;
+	background-color: rgba(255, 235, 0, 0.15);
+	border-radius: 0;
+	border-bottom: 3px solid rgba(200, 170, 0, 0.85);
 	pointer-events: none;
 	z-index: 999999998;
 
@@ -317,8 +329,8 @@ body.obsidian-highlighter-active {
 	}
 
 	&.obsidian-highlight-overlay-dark {
-		mix-blend-mode: screen;
-		background-color: rgba(255, 235, 0, 0.25);
+		background-color: rgba(255, 235, 0, 0.15);
+		border-bottom-color: rgba(200, 170, 0, 0.85);
 		&.is-hovering {
 			border: 2px dashed rgb(255, 235, 0, 0.5);
 		}
@@ -337,14 +349,7 @@ body.obsidian-highlighter-active {
 }
 
 #obsidian-highlight-hover-overlay {
-	position: absolute;
-	border-radius: 4px;
-	border: 2px dashed rgb(255, 235, 0, 0.8);
-	pointer-events: none;
-	z-index: 999999997;
-	&.on-highlight {
-		border-color: transparent;
-	}
+	display: none !important;
 }
 
 @keyframes clipperOpenAnimation {

@@ -18,6 +18,7 @@ let touchStartX: number = 0;
 let touchStartY: number = 0;
 let isTouchMoved: boolean = false;
 let lastHoverTarget: Element | null = null;
+let selectionPreviewElements: HTMLElement[] = [];
 
 const LINE_BY_LINE_OVERLAY_TAGS = ['P'];
 
@@ -71,43 +72,10 @@ export function handleMouseUp(event: MouseEvent | TouchEvent) {
 		target = document.elementFromPoint(touch.clientX, touch.clientY) as Element;
 	}
 
+	removeSelectionPreview();
 	const selection = window.getSelection();
 	if (selection && !selection.isCollapsed) {
 		handleTextSelection(selection);
-	} else {
-		if (target.classList.contains('obsidian-highlight-overlay')) {
-			handleHighlightClick(event);
-		} else {
-			let elementToProcess: Element | null = target;
-			const targetTagName = target.tagName.toUpperCase();
-
-			if (['TD', 'TH', 'TR'].includes(targetTagName)) {
-				elementToProcess = target.closest('table');
-				if (!elementToProcess) {
-					// Clicked table cell/row not in a table, so do nothing.
-					return; 
-				}
-				// If a table is found, elementToProcess is now the table.
-				// highlightElement will verify if 'TABLE' is an allowed tag.
-			} else {
-				// Original target was not a table cell/row.
-				// isIgnoredElement returns true if element is NOT allowed.
-				if (isIgnoredElement(target)) {
-					// If target is ignored, check its parent.
-					if (target.parentElement && !isIgnoredElement(target.parentElement)) {
-						elementToProcess = target.parentElement;
-					} else {
-						// Target is ignored, and parent is also ignored or doesn't exist.
-						return;
-					}
-				}
-				// If target was not ignored, elementToProcess remains target.
-			}
-
-			if (elementToProcess) {
-				highlightElement(elementToProcess);
-			}
-		}
 	}
 }
 
@@ -531,6 +499,38 @@ async function handleHighlightClick(event: Event) {
 	} catch (error) {
 		console.error('Error handling highlight click:', error);
 	}
+}
+
+// Live selection preview — renders overlay matching final highlight style during drag
+export function handleSelectionChange() {
+	removeSelectionPreview();
+	const selection = window.getSelection();
+	if (!selection || selection.isCollapsed) return;
+
+	for (let i = 0; i < selection.rangeCount; i++) {
+		const range = selection.getRangeAt(i);
+		const rects = range.getClientRects();
+		for (let j = 0; j < rects.length; j++) {
+			const rect = rects[j];
+			if (rect.width === 0 || rect.height === 0) continue;
+			const el = document.createElement('div');
+			el.className = 'obsidian-selection-preview';
+			el.style.position = 'absolute';
+			el.style.left = `${rect.left + window.scrollX - 2}px`;
+			el.style.top = `${rect.top + window.scrollY - 2}px`;
+			el.style.width = `${rect.width + 4}px`;
+			el.style.height = `${rect.height + 4}px`;
+			el.style.pointerEvents = 'none';
+			el.style.zIndex = '999999997';
+			document.body.appendChild(el);
+			selectionPreviewElements.push(el);
+		}
+	}
+}
+
+export function removeSelectionPreview() {
+	selectionPreviewElements.forEach(el => el.remove());
+	selectionPreviewElements = [];
 }
 
 // Remove all existing highlight overlays from the page

@@ -8,7 +8,9 @@ import {
 	planHighlightOverlayRects,
 	removeExistingHighlights,
 	handleTouchStart,
-	handleTouchMove
+	handleTouchMove,
+	handleSelectionChange,
+	removeSelectionPreview
 } from './highlighter-overlays';
 import { detectBrowser, addBrowserClassToHtml } from './browser-detection';
 import { generalSettings, loadSettings } from './storage-utils';
@@ -133,6 +135,7 @@ export function toggleHighlighterMenu(isActive: boolean) {
 		document.addEventListener('touchmove', handleTouchMove);
 		document.addEventListener('touchend', handleMouseUp);
 		document.addEventListener('keydown', handleKeyDown);
+		document.addEventListener('selectionchange', handleSelectionChange);
 		disableLinkClicks();
 		createHighlighterMenu();
 		addBrowserClassToHtml();
@@ -145,6 +148,8 @@ export function toggleHighlighterMenu(isActive: boolean) {
 		document.removeEventListener('touchmove', handleTouchMove);
 		document.removeEventListener('touchend', handleMouseUp);
 		document.removeEventListener('keydown', handleKeyDown);
+		document.removeEventListener('selectionchange', handleSelectionChange);
+		removeSelectionPreview();
 		removeHoverOverlay();
 		enableLinkClicks();
 		removeHighlighterMenu();
