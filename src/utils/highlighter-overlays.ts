@@ -13,11 +13,9 @@ import {
 import { throttle } from './throttle';
 import { getElementByXPath, isDarkColor } from './dom-utils';
 
-let hoverOverlay: HTMLElement | null = null;
 let touchStartX: number = 0;
 let touchStartY: number = 0;
 let isTouchMoved: boolean = false;
-let lastHoverTarget: Element | null = null;
 let selectionPreviewElements: HTMLElement[] = [];
 
 const LINE_BY_LINE_OVERLAY_TAGS = ['P'];
@@ -39,22 +37,8 @@ function isIgnoredElement(element: Element): boolean {
 		isDisallowedTag;
 }
 
-// Handles mouse move events for hover effects
-export function handleMouseMove(event: MouseEvent | TouchEvent) {
-	let target: Element;
-	if (event instanceof MouseEvent) {
-		target = event.target as Element;
-	} else {
-		// Touch event
-		const touch = event.changedTouches[0];
-		target = document.elementFromPoint(touch.clientX, touch.clientY) as Element;
-	}
-
-	if (!isIgnoredElement(target)) {
-		createOrUpdateHoverOverlay(target);
-	} else {
-		removeHoverOverlay();
-	}
+// Handles mouse move events (hover overlay removed, kept as no-op for event registration)
+export function handleMouseMove(_event: MouseEvent | TouchEvent) {
 }
 
 // Handle mouse up events for highlighting
@@ -380,89 +364,8 @@ observer.observe(document.body, {
 });
 
 // Create or update the hover overlay used to indicate which element will be highlighted
-function createOrUpdateHoverOverlay(target: Element) {
-	// Only update if the target has changed
-	if (target === lastHoverTarget) return;
-	lastHoverTarget = target;
-
-	let elementForHoverRect: Element | null = target;
-	const eventTargetTagName = target.tagName.toUpperCase();
-
-	if (['TD', 'TH', 'TR'].includes(eventTargetTagName)) {
-		elementForHoverRect = target.closest('table');
-	}
-
-	// Now, elementForHoverRect is either the table, the original target, or null.
-	// Check if this elementForHoverRect itself is valid (i.e., not ignored).
-	// isIgnoredElement returns true if the element's tag is NOT in the allowed list for hover
-	// (or if it's html, body etc.).
-	if (elementForHoverRect && !isIgnoredElement(elementForHoverRect)) {
-		// This is a valid element to get bounds from.
-	} else if (target.parentElement && !isIgnoredElement(target.parentElement) && !['TD', 'TH', 'TR'].includes(eventTargetTagName)) {
-		// If the primary elementForHoverRect (table or original target) was not valid (null or ignored),
-		// AND the original event target was not a table cell (because for cells, we only care about the table's validity),
-		// THEN consider the original event target's parent as the element for the hover rectangle.
-		elementForHoverRect = target.parentElement;
-	} else {
-		// Otherwise (no valid candidate found after checking primary and parent (for non-cells))
-		removeHoverOverlay();
-		return;
-	}
-
-	// If, after all logic, elementForHoverRect is null (e.g. a TD not in a table, or other unhandled cases), remove overlay.
-	if (!elementForHoverRect) {
-		removeHoverOverlay();
-		return;
-	}
-
-	if (!hoverOverlay) {
-		hoverOverlay = document.createElement('div');
-		hoverOverlay.id = 'obsidian-highlight-hover-overlay';
-		document.body.appendChild(hoverOverlay);
-	}
-	
-	const rect = elementForHoverRect.getBoundingClientRect();
-
-	hoverOverlay.style.position = 'absolute';
-	hoverOverlay.style.left = `${rect.left + window.scrollX - 2}px`;
-	hoverOverlay.style.top = `${rect.top + window.scrollY - 2}px`;
-	hoverOverlay.style.width = `${rect.width + 4}px`;
-	hoverOverlay.style.height = `${rect.height + 4}px`;
-	hoverOverlay.style.display = 'block';
-
-	// Remove 'is-hovering' class from all highlight overlays
-	document.querySelectorAll('.obsidian-highlight-overlay.is-hovering').forEach(el => {
-		el.classList.remove('is-hovering');
-	});
-
-	// Remove 'on-highlight' class from hover overlay
-	hoverOverlay.classList.remove('on-highlight');
-
-	// Check if the target is a highlight overlay
-	if (target.classList.contains('obsidian-highlight-overlay')) {
-		const index = target.getAttribute('data-highlight-index');
-		if (index) {
-			// Add 'is-hovering' class to all highlight overlays with the same index
-			document.querySelectorAll(`.obsidian-highlight-overlay[data-highlight-index="${index}"]`).forEach(el => {
-				el.classList.add('is-hovering');
-			});
-			// Add 'on-highlight' class to hover overlay
-			hoverOverlay.classList.add('on-highlight');
-		}
-	}
-}
-
-// Modify the removeHoverOverlay function to also remove the 'is-hovering' class
 export function removeHoverOverlay() {
-	if (hoverOverlay) {
-		hoverOverlay.style.display = 'none';
-	}
-	lastHoverTarget = null;
-
-	// Remove 'is-hovering' class from all highlight overlays
-	document.querySelectorAll('.obsidian-highlight-overlay.is-hovering').forEach(el => {
-		el.classList.remove('is-hovering');
-	});
+	// no-op: hover overlay removed
 }
 
 // Update the type of handleHighlightClick
