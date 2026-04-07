@@ -380,3 +380,25 @@
 	}
 
 }
+
+.obsidian-reader-active[data-reader-theme="midnight"] {
+	--background-primary: #0d0d0d;
+	--background-primary-alt: #141414;
+	--text-normal: #d4d4d4;
+	--text-muted: #858585;
+	--text-faint: #525252;
+	--text-accent: #d4d4d4;
+	--text-accent-hover: #e0e0e0;
+	--background-modifier-border: #252525;
+	--text-selection: rgba(255, 255, 255, 0.08);
+	--color-red: #e06c75;
+	--color-orange: #d19a66;
+	--color-yellow: #e5c07b;
+	--color-green: #98c379;
+	--color-cyan: #56b6c2;
+	--color-blue: #a0b8cf;
+	--color-purple: #c0a0dc;
+	--color-pink: #d4a0b8;
+
+	color-scheme: dark;
+}

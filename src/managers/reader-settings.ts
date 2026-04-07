@@ -16,6 +16,7 @@ const THEMES: Array<{ id: string; name: string }> = [
 	{ id: 'nord', name: 'Nord' },
 	{ id: 'rose-pine', name: 'Rosé Pine' },
 	{ id: 'solarized', name: 'Solarized' },
+	{ id: 'midnight', name: 'Midnight' },
 ];
 
 function getIsDark(appearance: string): boolean {
