@@ -335,33 +335,47 @@ const throttledUpdateHighlights = throttle(() => {
 	}
 }, 100);
 
-window.addEventListener('resize', throttledUpdateHighlights);
-window.addEventListener('scroll', throttledUpdateHighlights);
+let overlayObserver: MutationObserver | null = null;
 
-const observer = new MutationObserver((mutations) => {
-	if (!isApplyingHighlights) {
-		const shouldUpdate = mutations.some(mutation => 
-			(mutation.type === 'childList' && 
-			 (mutation.target instanceof Element) && 
-			 !mutation.target.id.startsWith('obsidian-highlight')) || 
-			(mutation.type === 'attributes' && 
-			 (mutation.attributeName === 'style' || mutation.attributeName === 'class') &&
-			 (mutation.target instanceof Element) &&
-			 !mutation.target.id.startsWith('obsidian-highlight'))
-		);
-		if (shouldUpdate) {
-			throttledUpdateHighlights();
-		}
+export function attachOverlayObservers(): void {
+	window.addEventListener('resize', throttledUpdateHighlights);
+	window.addEventListener('scroll', throttledUpdateHighlights);
+
+	if (!overlayObserver) {
+		overlayObserver = new MutationObserver((mutations) => {
+			if (!isApplyingHighlights) {
+				const shouldUpdate = mutations.some(mutation =>
+					(mutation.type === 'childList' &&
+					 (mutation.target instanceof Element) &&
+					 !mutation.target.id.startsWith('obsidian-highlight')) ||
+					(mutation.type === 'attributes' &&
+					 (mutation.attributeName === 'style' || mutation.attributeName === 'class') &&
+					 (mutation.target instanceof Element) &&
+					 !mutation.target.id.startsWith('obsidian-highlight'))
+				);
+				if (shouldUpdate) {
+					throttledUpdateHighlights();
+				}
+			}
+		});
+		overlayObserver.observe(document.body, {
+			childList: true,
+			subtree: true,
+			attributes: true,
+			attributeFilter: ['style', 'class'],
+			characterData: false
+		});
 	}
-});
+}
 
-observer.observe(document.body, { 
-	childList: true, 
-	subtree: true, 
-	attributes: true,
-	attributeFilter: ['style', 'class'],
-	characterData: false
-});
+export function detachOverlayObservers(): void {
+	window.removeEventListener('resize', throttledUpdateHighlights);
+	window.removeEventListener('scroll', throttledUpdateHighlights);
+	if (overlayObserver) {
+		overlayObserver.disconnect();
+		overlayObserver = null;
+	}
+}
 
 // Create or update the hover overlay used to indicate which element will be highlighted
 export function removeHoverOverlay() {

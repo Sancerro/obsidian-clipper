@@ -5,18 +5,13 @@ import { buildVariables, addSchemaOrgDataToVariables } from './shared';
 import browser from './browser-polyfill';
 import { debugLog } from './debug';
 import dayjs from 'dayjs';
-import { AnyHighlightData, TextHighlightData, HighlightData } from './highlighter';
+import { AnyHighlightData, TextHighlightData, ElementHighlightData, HighlightData } from './highlighter';
 import { generalSettings } from './storage-utils';
 import {
 	getElementByXPath,
 	wrapElementWithMark,
 	wrapTextWithMark
 } from './dom-utils';
-
-// Define ElementHighlightData type inline since it's not exported from highlighter.ts
-interface ElementHighlightData extends HighlightData {
-	type: 'element';
-}
 
 function canHighlightElement(element: Element): boolean {
 	// List of elements that can't be nested inside mark

@@ -472,7 +472,6 @@ declare global {
 				}
 
 				if (elementToHighlight) {
-					const xpath = highlighter.getElementXPath(elementToHighlight);
 					highlighter.highlightElement(elementToHighlight);
 				} else {
 					console.warn('Could not find element to highlight. Info:', request.targetElementInfo);
@@ -542,6 +541,22 @@ declare global {
 
 	// Initialize highlighter
 	initializeHighlighter();
+
+	// H key toggles highlighter on the original page
+	document.addEventListener('keydown', (e) => {
+		// Skip if reader mode is active (reader has its own key handlers)
+		if (document.documentElement.classList.contains('obsidian-reader-active')) return;
+		if (e.ctrlKey || e.metaKey || e.altKey) return;
+		const tag = (document.activeElement as HTMLElement)?.tagName;
+		if (tag === 'INPUT' || tag === 'TEXTAREA' || (document.activeElement as HTMLElement)?.isContentEditable) return;
+
+		if (e.key === 'h' || e.key === 'H') {
+			isHighlighterMode = !isHighlighterMode;
+			highlighter.toggleHighlighterMenu(isHighlighterMode);
+			updateHasHighlights();
+			browser.runtime.sendMessage({ action: "highlighterModeChanged", isActive: isHighlighterMode });
+		}
+	});
 
 	// Call updateHasHighlights when the page loads
 	window.addEventListener('load', updateHasHighlights);

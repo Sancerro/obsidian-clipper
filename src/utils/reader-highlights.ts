@@ -1,0 +1,808 @@
+/**
+ * Reader-mode highlight system.
+ * Handles selection → mark wrapping, text anchoring, and local persistence.
+ * Shared by both Obsidian-linked notes and regular reader-mode pages.
+ */
+import browser from './browser-polyfill';
+import { pluginFetch } from './plugin-url';
+
+// ── Types ────────────────────────────────────────────────
+
+export interface ReaderHighlightData {
+	id: string;
+	exactText: string;
+	prefixText: string;
+	suffixText: string;
+}
+
+// ── Content root detection ───────────────────────────────
+
+// Order matters: most specific content containers first, generic wrappers last.
+const CONTENT_SELECTORS = [
+	'article',                    // reader mode + semantic HTML
+	'.mw-parser-output',          // Wikipedia
+	'#mw-content-text',           // Wikipedia fallback
+	'.entry-content',             // WordPress standard
+	'.wp-block-post-content',     // WordPress FSE themes
+	'.post-content',              // common blog pattern
+	'.article-content',           // news sites
+	'.article-body',              // news sites
+	'.post-body',                 // Blogger
+	'#content .post',             // common pattern
+	'main',                       // semantic main (broad — can include nav/footer in FSE)
+	'[role="main"]',              // ARIA main
+];
+
+function findContentRoot(): Element {
+	for (const sel of CONTENT_SELECTORS) {
+		const el = document.querySelector(sel);
+		if (el) return el;
+	}
+	return document.body;
+}
+
+// ── Selection → Highlight ────────────────────────────────
+
+export function handleReaderModeHighlight(selection: Selection): void {
+	const range = selection.getRangeAt(0);
+	if (selection.toString().trim() === '') {
+		selection.removeAllRanges();
+		return;
+	}
+
+	const root = findContentRoot();
+	if (!root || !root.contains(range.startContainer) || !root.contains(range.endContainer)) {
+		selection.removeAllRanges();
+		return;
+	}
+
+	clampRangeToBlock(range);
+	expandRangeToWordBoundaries(range);
+
+	const exactText = getRangeCleanText(range);
+	if (!exactText) {
+		selection.removeAllRanges();
+		return;
+	}
+
+	const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+
+	// Merge with any overlapping existing highlights
+	const overlappingIds = findOverlappingHighlightIds(range);
+	if (overlappingIds.length > 0) {
+		// Expand range to cover all overlapping marks
+		for (const oid of overlappingIds) {
+			const marks = root.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${oid}"]`);
+			for (let i = 0; i < marks.length; i++) {
+				const markRange = document.createRange();
+				markRange.selectNodeContents(marks[i]);
+				if (markRange.compareBoundaryPoints(Range.START_TO_START, range) < 0) {
+					range.setStart(markRange.startContainer, markRange.startOffset);
+				}
+				if (markRange.compareBoundaryPoints(Range.END_TO_END, range) > 0) {
+					range.setEnd(markRange.endContainer, markRange.endOffset);
+				}
+			}
+		}
+		// Remove old marks from DOM
+		for (const oid of overlappingIds) {
+			root.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${oid}"]`).forEach(m => {
+				m.replaceWith(...Array.from(m.childNodes));
+			});
+		}
+		// Remove old highlights from storage + plugin
+		for (const oid of overlappingIds) {
+			removeReaderHighlight(url, oid);
+			pluginFetch('/highlights/remove', {
+				method: 'POST',
+				body: { url, highlightId: oid }
+			}).catch(() => {});
+		}
+		// Re-expand to word boundaries after merge
+		expandRangeToWordBoundaries(range);
+	}
+
+	const mergedText = getRangeCleanText(range);
+	if (!mergedText) {
+		selection.removeAllRanges();
+		return;
+	}
+
+	const fullText = getCleanTextContent(root);
+	const startOffset = getCleanTextOffset(root, range.startContainer, range.startOffset);
+	const endOffset = getCleanTextOffset(root, range.endContainer, range.endOffset);
+	const prefixText = fullText.slice(Math.max(0, startOffset - 40), startOffset);
+	const suffixText = fullText.slice(endOffset, endOffset + 40);
+
+	const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+	wrapRangeInMarks(range, 'reading-selection-highlight-mark', id);
+	selection.removeAllRanges();
+
+	document.dispatchEvent(new CustomEvent('obsidian-optimistic-add', { detail: { id } }));
+
+	const highlightData = { id, exactText: mergedText, prefixText, suffixText };
+	saveReaderHighlight(url, highlightData);
+
+	pluginFetch('/highlights/add', {
+		method: 'POST',
+		body: { url, highlight: highlightData }
+	}).then(res => {
+		if (!res.ok && res.status === 0) showPluginOfflineToast();
+	}).catch(() => {
+		showPluginOfflineToast();
+	});
+}
+
+// ── Text extraction (skipping <sup> citation noise) ─────
+
+/** Get textContent of an element, skipping citation <sup> descendants. */
+export function getCleanTextContent(el: Element): string {
+	const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+		acceptNode(node) {
+			return isInsideCitationSup(node, el) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+		}
+	});
+	let text = '';
+	while (walker.nextNode()) {
+		text += walker.currentNode.textContent || '';
+	}
+	return text;
+}
+
+/** Get text content of a range, skipping citation <sup> descendants only. */
+function getRangeCleanText(range: Range): string {
+	const frag = range.cloneContents();
+	const sups = frag.querySelectorAll('sup');
+	for (let i = 0; i < sups.length; i++) {
+		const s = sups[i];
+		if (s.classList.contains('reference') || s.classList.contains('footnote-ref') ||
+			(s.id && (s.id.startsWith('fnref') || s.id.startsWith('cite_ref')))) {
+			s.remove();
+		}
+	}
+	return (frag.textContent || '').trim();
+}
+
+/** Calculate text offset within a container, skipping <sup> descendants. */
+function getCleanTextOffset(container: Element, targetNode: Node, targetOffset: number): number {
+	// Resolve element nodes to text nodes
+	if (targetNode.nodeType === Node.ELEMENT_NODE) {
+		const children = targetNode.childNodes;
+		if (targetOffset < children.length) {
+			targetNode = children[targetOffset];
+			targetOffset = 0;
+			if (targetNode.nodeType !== Node.TEXT_NODE) {
+				const w = document.createTreeWalker(targetNode, NodeFilter.SHOW_TEXT);
+				const first = w.nextNode();
+				if (first) { targetNode = first; targetOffset = 0; }
+			}
+		} else {
+			const w = document.createTreeWalker(targetNode, NodeFilter.SHOW_TEXT);
+			let last: Node | null = null;
+			while (w.nextNode()) { last = w.currentNode; }
+			if (last) { targetNode = last; targetOffset = last.textContent?.length || 0; }
+		}
+	}
+
+	// If target is inside a citation sup, snap offset to boundary
+	const insideCite = isInsideCitationSup(targetNode, container);
+
+	let offset = 0;
+	const tw = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+	let n: Node | null;
+	while ((n = tw.nextNode())) {
+		if (isInsideCitationSup(n, container)) {
+			if (insideCite && n === targetNode) return offset;
+			continue;
+		}
+		if (n === targetNode) return offset + targetOffset;
+		offset += (n.textContent?.length || 0);
+	}
+	return offset;
+}
+
+// ── Overlap detection ───────────────────────────────────
+
+function findOverlappingHighlightIds(range: Range): string[] {
+	const ids = new Set<string>();
+	const marks = document.querySelectorAll('.reading-selection-highlight-mark');
+	for (let i = 0; i < marks.length; i++) {
+		const mark = marks[i] as HTMLElement;
+		if (range.intersectsNode(mark) && mark.dataset.highlightId) {
+			ids.add(mark.dataset.highlightId);
+		}
+	}
+	return Array.from(ids);
+}
+
+// ── Range manipulation ───────────────────────────────────
+
+const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BLOCKQUOTE', 'PRE', 'TD', 'TH', 'FIGCAPTION', 'DT', 'DD']);
+
+function clampRangeToBlock(range: Range): void {
+	let block: HTMLElement | null = null;
+	let node: Node | null = range.startContainer;
+	while (node && node !== document.body) {
+		if (node instanceof HTMLElement && BLOCK_TAGS.has(node.tagName)) {
+			block = node;
+			break;
+		}
+		node = node.parentNode;
+	}
+	if (!block) return;
+
+	if (!block.contains(range.endContainer)) {
+		const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+		let lastText: Text | null = null;
+		let current: Node | null;
+		while ((current = walker.nextNode())) {
+			lastText = current as Text;
+		}
+		if (lastText) {
+			range.setEnd(lastText, lastText.length);
+		}
+	}
+}
+
+function expandRangeToWordBoundaries(range: Range): void {
+	const startNode = range.startContainer;
+	if (startNode.nodeType === Node.TEXT_NODE) {
+		const text = startNode.textContent || '';
+		let offset = range.startOffset;
+		while (offset < text.length && /\s/.test(text[offset])) offset++;
+		while (offset > 0 && !/\s/.test(text[offset - 1])) offset--;
+		range.setStart(startNode, offset);
+	}
+
+	const endNode = range.endContainer;
+	if (endNode.nodeType === Node.TEXT_NODE) {
+		const text = endNode.textContent || '';
+		let offset = range.endOffset;
+		while (offset > 0 && /\s/.test(text[offset - 1])) offset--;
+		while (offset < text.length && !/\s/.test(text[offset])) offset++;
+		range.setEnd(endNode, offset);
+	}
+}
+
+// ── Mark wrapping ────────────────────────────────────────
+
+const INLINE_TAGS = new Set(['EM', 'I', 'STRONG', 'B', 'A', 'SPAN', 'CODE', 'SUB', 'SUP', 'MARK', 'U', 'S', 'SMALL', 'ABBR', 'CITE', 'DFN', 'KBD', 'SAMP', 'VAR', 'TIME', 'Q']);
+function isInlineElement(el: HTMLElement): boolean {
+	return INLINE_TAGS.has(el.tagName);
+}
+
+export function wrapRangeInMarks(range: Range, className: string, id: string): void {
+	const walker = document.createTreeWalker(
+		range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+			? range.commonAncestorContainer.parentElement!
+			: range.commonAncestorContainer,
+		NodeFilter.SHOW_TEXT
+	);
+	const textNodes: Text[] = [];
+	let node: Node | null;
+	const root = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+		? range.commonAncestorContainer.parentElement!
+		: range.commonAncestorContainer;
+	while ((node = walker.nextNode())) {
+		if (range.intersectsNode(node) && !isInsideCitationSup(node, root as Element)) {
+			textNodes.push(node as Text);
+		}
+	}
+
+	for (let i = textNodes.length - 1; i >= 0; i--) {
+		const textNode = textNodes[i];
+		const nodeRange = document.createRange();
+		const start = textNode === range.startContainer ? range.startOffset : 0;
+		const end = textNode === range.endContainer ? range.endOffset : textNode.length;
+		if (start >= end) continue;
+
+		nodeRange.setStart(textNode, start);
+		nodeRange.setEnd(textNode, end);
+		if (!nodeRange.toString()) continue;
+
+		const mark = document.createElement('span');
+		mark.className = className;
+		mark.dataset.highlightId = id;
+		nodeRange.surroundContents(mark);
+	}
+
+	// Coalesce adjacent marks.
+	// In reader mode: full coalescing (merge through inline elements).
+	// On original page: safe coalescing only (merge adjacent mark spans + whitespace).
+	const isReaderMode = document.documentElement.classList.contains('obsidian-reader-active');
+	const coalRoot = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+		? range.commonAncestorContainer.parentElement!
+		: range.commonAncestorContainer as HTMLElement;
+	let changed = true;
+	while (changed) {
+		changed = false;
+		const marks = Array.from(coalRoot.querySelectorAll<HTMLElement>(`.${className}[data-highlight-id="${id}"]`));
+		for (const mark of marks) {
+			let next = mark.nextSibling;
+			while (next) {
+				// Safe: absorb whitespace between marks
+				if (next instanceof Text && next.nodeValue?.trim() === '') {
+					const ws = next;
+					next = ws.nextSibling;
+					mark.appendChild(ws);
+					changed = true;
+					continue;
+				}
+				// Safe: merge adjacent marks with same ID
+				if (next instanceof HTMLElement && next.classList.contains(className) && next.dataset.highlightId === id) {
+					while (next.firstChild) mark.appendChild(next.firstChild);
+					const current = next;
+					next = current.nextSibling;
+					current.remove();
+					changed = true;
+					continue;
+				}
+				// Reader mode only: absorb inline elements whose text is all marked
+				if (isReaderMode && next instanceof HTMLElement && isInlineElement(next)) {
+					const innerMarks = next.querySelectorAll(`.${className}[data-highlight-id="${id}"]`);
+					if (innerMarks.length > 0 && next.textContent?.trim() === Array.from(innerMarks).map(m => m.textContent).join('').trim()) {
+						const el = next;
+						next = el.nextSibling;
+						innerMarks.forEach(m => {
+							while (m.firstChild) m.parentNode!.insertBefore(m.firstChild, m);
+							m.remove();
+						});
+						mark.appendChild(el);
+						changed = true;
+						continue;
+					}
+				}
+				break;
+			}
+		}
+	}
+}
+
+// ── Text range finding (for re-applying stored highlights) ──
+
+export function findTextRange(
+	root: Element, fullText: string,
+	exactText: string, prefixText: string, suffixText: string
+): Range | null {
+	// 1. Try full context match (prefix + exact + suffix)
+	const searchStr = prefixText + exactText + suffixText;
+	let idx = fullText.indexOf(searchStr);
+	if (idx !== -1) {
+		return buildRangeFromOffset(root, idx + prefixText.length, idx + prefixText.length + exactText.length);
+	}
+
+	// 2. Try exact text match
+	idx = fullText.indexOf(exactText);
+	if (idx !== -1) {
+		return buildRangeFromOffset(root, idx, idx + exactText.length);
+	}
+
+	// 3. Try matching a suffix of exactText, then extend backward to cover the full range.
+	//    Reader mode (Defuddle) strips IPA, citations, etc. so the beginning of the stored
+	//    text may not exist on the original page, but the content portion usually does.
+	//    Also try with trailing bare citation digits stripped (Defuddle keeps "5" but page has "[5]").
+	if (exactText.length > 40) {
+		const cleaned = exactText.replace(/\d+$/g, '').trimEnd();
+		const candidates = cleaned !== exactText ? [exactText, cleaned] : [exactText];
+
+		for (const candidate of candidates) {
+			if (candidate.length < 40) continue;
+			for (let cut = Math.floor(candidate.length * 0.3); cut < candidate.length - 20; cut++) {
+				const suffix = candidate.slice(cut);
+				const suffixIdx = fullText.indexOf(suffix);
+				if (suffixIdx !== -1) {
+					const endIdx = suffixIdx + suffix.length;
+					// Find the first word of exactText before the suffix match to extend the range
+					const firstWord = exactText.match(/\w[\w\u00C0-\u024F'-]+/)?.[0];
+					if (firstWord && firstWord.length >= 3) {
+						const searchRegion = fullText.slice(0, suffixIdx);
+						const firstWordIdx = searchRegion.lastIndexOf(firstWord);
+						if (firstWordIdx !== -1 && suffixIdx - firstWordIdx < exactText.length * 3) {
+							return buildRangeFromOffset(root, firstWordIdx, endIdx);
+						}
+					}
+					return buildRangeFromOffset(root, suffixIdx, endIdx);
+				}
+			}
+		}
+	}
+
+	return null;
+}
+
+/** Check if a node is inside a citation <sup> (not math/content superscripts). */
+function isInsideCitationSup(node: Node, root: Element): boolean {
+	let p = node.parentElement;
+	while (p && p !== root) {
+		if (p.tagName === 'SUP') {
+			// Citation refs: sup.reference (Wikipedia), sup.footnote-ref, sup[id^="fnref"] (Defuddle)
+			if (p.classList.contains('reference') || p.classList.contains('footnote-ref') ||
+				(p.id && p.id.startsWith('fnref')) || (p.id && p.id.startsWith('cite_ref'))) {
+				return true;
+			}
+		}
+		p = p.parentElement;
+	}
+	return false;
+}
+
+function buildRangeFromOffset(root: Element, idx: number, endIdx: number): Range | null {
+	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+	let charCount = 0;
+	let startNode: Text | null = null, startOff = 0;
+	let endNode: Text | null = null, endOff = 0;
+
+	while (walker.nextNode()) {
+		const tn = walker.currentNode as Text;
+		// Skip text inside <sup> (citations) — consistent with getCleanTextContent
+		if (isInsideCitationSup(tn, root)) continue;
+		const len = tn.length;
+		if (!startNode && charCount + len > idx) {
+			startNode = tn;
+			startOff = idx - charCount;
+		}
+		if (charCount + len >= endIdx) {
+			endNode = tn;
+			endOff = endIdx - charCount;
+			break;
+		}
+		charCount += len;
+	}
+
+	if (!startNode || !endNode) return null;
+	const r = document.createRange();
+	r.setStart(startNode, startOff);
+	r.setEnd(endNode, endOff);
+	return r;
+}
+
+// ── Local persistence (serialized queue) ─────────────────
+
+let storageQueue: Promise<void> = Promise.resolve();
+
+function enqueue(fn: () => Promise<void>): void {
+	storageQueue = storageQueue.then(fn, fn);
+}
+
+function saveReaderHighlight(url: string, highlight: ReaderHighlightData): void {
+	enqueue(async () => {
+		const result = await browser.storage.local.get('readerHighlights') as Record<string, unknown>;
+		const all = (result.readerHighlights || {}) as Record<string, ReaderHighlightData[]>;
+		const existing = all[url] || [];
+		if (!existing.some(h => h.id === highlight.id)) existing.push(highlight);
+		all[url] = existing;
+		await browser.storage.local.set({ readerHighlights: all });
+	});
+}
+
+export function removeReaderHighlight(url: string, highlightId: string): void {
+	enqueue(async () => {
+		const result = await browser.storage.local.get('readerHighlights') as Record<string, unknown>;
+		const all = (result.readerHighlights || {}) as Record<string, ReaderHighlightData[]>;
+		const existing = all[url] || [];
+		all[url] = existing.filter(h => h.id !== highlightId);
+		if (all[url].length === 0) delete all[url];
+		await browser.storage.local.set({ readerHighlights: all });
+	});
+}
+
+export function clearReaderHighlights(url: string): void {
+	enqueue(async () => {
+		const result = await browser.storage.local.get('readerHighlights') as Record<string, unknown>;
+		const all = (result.readerHighlights || {}) as Record<string, ReaderHighlightData[]>;
+		delete all[url];
+		await browser.storage.local.set({ readerHighlights: all });
+	});
+}
+
+/** Wait for any pending writes to complete before reading. */
+export function drainStorageQueue(): Promise<void> {
+	return storageQueue;
+}
+
+export async function loadReaderHighlights(url: string): Promise<ReaderHighlightData[]> {
+	await drainStorageQueue();
+	const result = await browser.storage.local.get('readerHighlights') as Record<string, unknown>;
+	const all = (result.readerHighlights || {}) as Record<string, ReaderHighlightData[]>;
+	return all[url] || [];
+}
+
+// ── Page-level highlight loading ─────────────────────────
+
+let orphanRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ── Shared SSE helper ────────────────────────────────────
+// Opens a long-lived Port to the background, which holds the actual EventSource
+// connection to the plugin (bypasses page CSP). Port lifetime = page lifetime.
+
+export interface HighlightSync {
+	stop: () => void;
+	update: (newUrl: string) => void;
+}
+
+/** Subscribe to highlight changes for a URL via background SSE. Callback fires on change. */
+export function subscribeHighlightChanges(url: string, onChange: () => void): HighlightSync {
+	let port: browser.Runtime.Port | null = null;
+	let currentUrl = url;
+
+	const connect = (subUrl: string) => {
+		try {
+			port = browser.runtime.connect({ name: 'highlight-sse' });
+			port.onMessage.addListener((msg: unknown) => {
+				if ((msg as any)?.action === 'pageHighlightsChanged') onChange();
+			});
+			port.onDisconnect.addListener(() => { port = null; });
+			port.postMessage({ action: 'subscribe', url: subUrl });
+		} catch { /* background unavailable */ }
+	};
+
+	connect(url);
+
+	return {
+		stop: () => {
+			if (port) {
+				try { port.disconnect(); } catch { /* already closed */ }
+				port = null;
+			}
+		},
+		update: (newUrl: string) => {
+			if (newUrl === currentUrl) return;
+			currentUrl = newUrl;
+			if (port) {
+				try { port.disconnect(); } catch { /* already closed */ }
+				port = null;
+			}
+			connect(newUrl);
+		},
+	};
+}
+
+// ── Page-level sync ──────────────────────────────────────
+
+let pageSync: HighlightSync | null = null;
+let spaNavListenersInstalled = false;
+
+function normalizeUrl(): string {
+	return window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+}
+
+function handleUrlChange(): void {
+	if (!pageSync) return;
+	const newUrl = normalizeUrl();
+	pageSync.update(newUrl);
+	loadAndApplyPageHighlights();
+}
+
+/** Start SSE sync with the plugin for the current page. */
+export function startPageHighlightSync(): void {
+	if (pageSync) return;
+	pageSync = subscribeHighlightChanges(normalizeUrl(), () => loadAndApplyPageHighlights());
+
+	// Watch for SPA navigation (pushState/replaceState/popstate)
+	if (!spaNavListenersInstalled) {
+		spaNavListenersInstalled = true;
+		window.addEventListener('popstate', handleUrlChange);
+		const origPushState = history.pushState;
+		const origReplaceState = history.replaceState;
+		history.pushState = function (...args) {
+			const result = origPushState.apply(this, args);
+			handleUrlChange();
+			return result;
+		};
+		history.replaceState = function (...args) {
+			const result = origReplaceState.apply(this, args);
+			handleUrlChange();
+			return result;
+		};
+	}
+}
+
+export function stopPageHighlightSync(): void {
+	if (pageSync) {
+		pageSync.stop();
+		pageSync = null;
+	}
+}
+
+/** Load text-anchor highlights from storage and apply as marks. */
+export async function loadAndApplyPageHighlights(): Promise<void> {
+	// Cancel any pending retry from a previous call
+	if (orphanRetryTimer !== null) {
+		clearTimeout(orphanRetryTimer);
+		orphanRetryTimer = null;
+	}
+	const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+	const root = findContentRoot();
+
+	// Merge plugin highlights (including highlights from linked Obsidian notes) with local ones
+	let pluginHighlights: ReaderHighlightData[] = [];
+	let pluginOnline = false;
+	try {
+		const res = await pluginFetch(`/highlights?url=${encodeURIComponent(url)}`);
+		if (res.ok) {
+			pluginOnline = true;
+			const data = res.data as { entry?: { highlights?: ReaderHighlightData[] } };
+			pluginHighlights = data.entry?.highlights ?? [];
+		}
+	} catch { /* plugin offline */ }
+
+	const localHighlights = await loadReaderHighlights(url);
+	const seenIds = new Set(pluginHighlights.map(h => h.id));
+	const highlights = [...pluginHighlights];
+	const localOnlyHighlights: ReaderHighlightData[] = [];
+	for (const lh of localHighlights) {
+		if (!seenIds.has(lh.id)) {
+			highlights.push(lh);
+			localOnlyHighlights.push(lh);
+		}
+	}
+
+	// Reconcile: if plugin is online, push any local-only highlights to the plugin
+	// (covers the case where plugin was offline when highlights were created).
+	if (pluginOnline && localOnlyHighlights.length > 0) {
+		for (const lh of localOnlyHighlights) {
+			pluginFetch('/highlights/add', {
+				method: 'POST',
+				body: { url, highlight: lh }
+			}).catch(() => {});
+		}
+	}
+
+	// Diff existing marks against desired set — only remove deleted, only add new.
+	// Avoids flickering when an unrelated highlight is added elsewhere on the page.
+	const desiredIds = new Set(highlights.map(h => h.id));
+	const existingIds = new Set<string>();
+	root.querySelectorAll<HTMLElement>('.reading-selection-highlight-mark').forEach(m => {
+		const id = m.dataset.highlightId;
+		if (!id) return;
+		if (desiredIds.has(id)) {
+			existingIds.add(id);
+		} else {
+			m.replaceWith(...Array.from(m.childNodes));
+		}
+	});
+
+	const toAdd = highlights.filter(h => !existingIds.has(h.id));
+	if (toAdd.length === 0) return;
+
+	const applied = applyHighlightMarks(root, toAdd);
+	const orphaned = toAdd.filter(h => !applied.has(h.id));
+
+	if (orphaned.length > 0) {
+		// Retry once after a delay — page content may still be loading
+		orphanRetryTimer = setTimeout(() => {
+			orphanRetryTimer = null;
+			const retryRoot = findContentRoot();
+			const retryText = getCleanTextContent(retryRoot);
+			const stillOrphaned: ReaderHighlightData[] = [];
+			for (const h of orphaned) {
+				// Skip if already applied by the first pass (shouldn't happen, but safe)
+				if (retryRoot.querySelector(`.reading-selection-highlight-mark[data-highlight-id="${h.id}"]`)) continue;
+				const range = findTextRange(retryRoot, retryText, h.exactText, h.prefixText, h.suffixText);
+				if (range) {
+					wrapRangeInMarks(range, 'reading-selection-highlight-mark', h.id);
+				} else {
+					stillOrphaned.push(h);
+				}
+			}
+			if (stillOrphaned.length > 0) {
+				showOrphanedHighlightsToast(stillOrphaned, url);
+			}
+		}, 3000);
+	}
+}
+
+function applyHighlightMarks(root: Element, highlights: ReaderHighlightData[]): Set<string> {
+	const fullText = getCleanTextContent(root);
+	const applied = new Set<string>();
+	for (const h of highlights) {
+		const range = findTextRange(root, fullText, h.exactText, h.prefixText, h.suffixText);
+		if (range) {
+			wrapRangeInMarks(range, 'reading-selection-highlight-mark', h.id);
+			applied.add(h.id);
+		}
+	}
+	return applied;
+}
+
+/** Wire delegated click-to-remove on page marks (call once). */
+let pageMarkClickWired = false;
+export function wirePageMarkClickHandlers(): void {
+	if (pageMarkClickWired) return;
+	pageMarkClickWired = true;
+
+	// Use capturing phase so clicks reach us even when disableLinkClicks() uses stopPropagation
+	document.addEventListener('click', (e: Event) => {
+		// Only remove when highlighter is active
+		if (!document.body.classList.contains('obsidian-highlighter-active')) return;
+
+		const target = e.target as Element;
+		const mark = target.closest?.('.reading-selection-highlight-mark');
+		if (!mark) return;
+
+		const highlightId = (mark as HTMLElement).dataset.highlightId;
+		if (!highlightId) return;
+
+		// Remove all spans with this highlight ID
+		document.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${highlightId}"]`).forEach(m => {
+			m.replaceWith(...Array.from(m.childNodes));
+		});
+
+		const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+		removeReaderHighlight(url, highlightId);
+
+		// Notify plugin
+		pluginFetch('/highlights/remove', {
+			method: 'POST',
+			body: { url, highlightId }
+		}).catch(() => {});
+	}, true);
+}
+
+// ── Orphaned highlights notification ─────────────────────
+
+function showOrphanedHighlightsToast(orphaned: ReaderHighlightData[], url: string): void {
+	const existing = document.getElementById('obsidian-orphaned-toast');
+	if (existing) existing.remove();
+
+	const count = orphaned.length;
+	const preview = orphaned.map(h =>
+		h.exactText.length > 50 ? h.exactText.slice(0, 50) + '…' : h.exactText
+	).join('\n');
+
+	const toast = document.createElement('div');
+	toast.id = 'obsidian-orphaned-toast';
+	toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#3a2a0a;color:#e0d8c8;padding:10px 16px;border-radius:8px;font:13px/1.4 system-ui,sans-serif;z-index:999999999;opacity:0;transition:opacity 0.3s;display:flex;align-items:center;gap:12px;max-width:500px;';
+
+	const text = document.createElement('span');
+	text.textContent = `${count} highlight${count > 1 ? 's' : ''} no longer found on this page`;
+	text.title = preview;
+	toast.appendChild(text);
+
+	const removeBtn = document.createElement('button');
+	removeBtn.textContent = 'Remove';
+	removeBtn.style.cssText = 'background:#5a3a0a;color:#e0d8c8;border:1px solid #7a5a2a;border-radius:4px;padding:2px 8px;cursor:pointer;font:inherit;white-space:nowrap;';
+	removeBtn.addEventListener('click', () => {
+		for (const h of orphaned) {
+			removeReaderHighlight(url, h.id);
+			pluginFetch('/highlights/remove', {
+				method: 'POST',
+				body: { url, highlightId: h.id }
+			}).catch(() => {});
+		}
+		toast.style.opacity = '0';
+		setTimeout(() => toast.remove(), 300);
+	});
+	toast.appendChild(removeBtn);
+
+	const dismissBtn = document.createElement('button');
+	dismissBtn.textContent = '✕';
+	dismissBtn.style.cssText = 'background:none;color:#e0d8c8;border:none;cursor:pointer;font:16px system-ui;padding:0 2px;opacity:0.6;';
+	dismissBtn.addEventListener('click', () => {
+		toast.style.opacity = '0';
+		setTimeout(() => toast.remove(), 300);
+	});
+	toast.appendChild(dismissBtn);
+
+	document.body.appendChild(toast);
+	requestAnimationFrame(() => { toast.style.opacity = '1'; });
+}
+
+// ── Toast ────────────────────────────────────────────────
+
+function showPluginOfflineToast(): void {
+	const existing = document.getElementById('obsidian-plugin-toast');
+	if (existing) return;
+
+	const toast = document.createElement('div');
+	toast.id = 'obsidian-plugin-toast';
+	toast.textContent = 'Obsidian plugin not running — highlights won\'t sync';
+	toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#e0e0e0;padding:8px 16px;border-radius:8px;font:13px/1.4 system-ui,sans-serif;z-index:999999999;opacity:0;transition:opacity 0.3s;pointer-events:none;';
+	document.body.appendChild(toast);
+	requestAnimationFrame(() => { toast.style.opacity = '1'; });
+	setTimeout(() => {
+		toast.style.opacity = '0';
+		setTimeout(() => toast.remove(), 300);
+	}, 3000);
+}

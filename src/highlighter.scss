@@ -1,3 +1,15 @@
+// Text-anchor marks on the original page (same visual as reader mode)
+.reading-selection-highlight-mark {
+	background: rgba(255, 220, 50, 0.25);
+	border-radius: 0.08em;
+	box-decoration-break: clone;
+	-webkit-box-decoration-break: clone;
+	box-shadow: inset 0 -0.1em 0 rgba(230, 180, 0, 0.9);
+}
+.obsidian-highlighter-active .reading-selection-highlight-mark {
+	cursor: pointer;
+}
+
 @media (max-width: 769px) {
 	.obsidian-highlighter-menu {
 		--obsidian-highlighter-menu-font-size: 15px;
@@ -127,17 +139,13 @@ body.obsidian-highlighter-active {
 
 	// Disable pinch zoom on mobile
 	touch-action: pan-x pan-y;
-	cursor: text;
-	a {
-		cursor: text !important;
-	}
 	*::selection {
 		background-color: transparent !important;
 		color: inherit !important;
 	}
 	.obsidian-selection-preview {
-		background-color: rgba(255, 235, 140, 0.18);
-		border-bottom: 2px solid rgba(255, 208, 0, 0.8);
+		background-color: rgba(255, 220, 50, 0.25);
+		border-bottom: 2px solid rgba(230, 180, 0, 0.9);
 	}
 	.obsidian-highlight-overlay {
 		cursor: pointer;
@@ -266,15 +274,15 @@ body.obsidian-highlighter-active {
 .obsidian-highlight-overlay {
 	display: none;
 	position: absolute;
-	background-color: rgba(255, 235, 140, 0.18);
+	background-color: rgba(255, 220, 50, 0.25);
 	border-radius: 0;
-	border-bottom: 2px solid rgba(255, 208, 0, 0.8);
+	border-bottom: 2px solid rgba(230, 180, 0, 0.9);
 	pointer-events: none;
 	z-index: 999999998;
 
 	&.obsidian-highlight-overlay-dark {
-		background-color: rgba(255, 235, 140, 0.18);
-		border-bottom-color: rgba(255, 208, 0, 0.8);
+		background-color: rgba(255, 220, 50, 0.25);
+		border-bottom-color: rgba(230, 180, 0, 0.9);
 	}
 }
 
