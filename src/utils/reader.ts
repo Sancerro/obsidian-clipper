@@ -130,6 +130,9 @@ export class Reader {
 		defaultFont: '',
 		blendImages: true,
 		colorLinks: false,
+		pinPlayer: true,
+		autoScroll: true,
+		highlightActiveLine: true,
 		customCss: ''
 	};
 
