@@ -78,17 +78,9 @@
 	},
 	"browser_specific_settings": {
 		"gecko": {
-			"id": "clipper@obsidian.md",
+			"id": "clipper-custom@baris.dev",
 			"strict_min_version": "113.0",
-			"data_collection_permissions": {
-				"required": ["none"]
-			}
-		},
-		"gecko_android": {
-			"strict_min_version": "113.0",
-			"data_collection_permissions": {
-				"required": ["none"]
-			}
+			"update_url": "https://raw.githubusercontent.com/Sancerro/obsidian-clipper-custom-builds/main/updates.json"
 		}
 	}
 }
