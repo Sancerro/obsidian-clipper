@@ -1,6 +1,5 @@
 import { 
 	handleTextSelection, 
-	highlightElement, 
 	AnyHighlightData, 
 	highlights, 
 	isApplyingHighlights,

@@ -7,7 +7,6 @@ import { extractContentBySelector as extractContentBySelectorShared } from './ut
 import { createMarkdownContent } from 'defuddle/full';
 import { flattenShadowDom } from './utils/flatten-shadow-dom';
 import { saveFile } from './utils/file-utils';
-import { debugLog } from './utils/debug';
 
 declare global {
 	interface Window {
@@ -24,45 +23,16 @@ declare global {
 	window.obsidianClipperGeneration = (window.obsidianClipperGeneration ?? 0) + 1;
 	const myGeneration = window.obsidianClipperGeneration;
 
-	debugLog('Clipper', 'Initializing content script, generation', myGeneration);
-
-	// In Reader mode, extract from the article's original HTML (before
-	// wireTranscript restructures it) with a neutral URL so site-specific
-	// extractors don't re-fetch content (e.g. YouTube)
-	function parseForClip(doc: Document) {
-		const readerArticle = doc.querySelector('.obsidian-reader-active .obsidian-reader-content article');
-		if (readerArticle) {
-			const readerDoc = doc.implementation.createHTMLDocument();
-			const originalHtml = readerArticle.getAttribute('data-original-html');
-			readerDoc.body.innerHTML = originalHtml || readerArticle.innerHTML;
-			return new Defuddle(readerDoc, { url: '' }).parse();
-		}
-		return new Defuddle(doc, { url: doc.URL }).parse();
-	}
+	console.log('[Obsidian Clipper] Initializing content script, generation', myGeneration);
 
 	let isHighlighterMode = false;
 	const iframeId = 'obsidian-clipper-iframe';
 	const containerId = 'obsidian-clipper-container';
 
-	let sidebarWidthRaf: number | null = null;
-
-	function updateSidebarWidth(container: HTMLElement | null) {
-		if (sidebarWidthRaf) cancelAnimationFrame(sidebarWidthRaf);
-		sidebarWidthRaf = requestAnimationFrame(() => {
-			if (container && document.contains(container)) {
-				document.documentElement.style.setProperty('--clipper-sidebar-width', `${container.offsetWidth + 24}px`);
-			} else {
-				document.documentElement.style.removeProperty('--clipper-sidebar-width');
-			}
-		});
-	}
-
 	function removeContainer(container: HTMLElement) {
 		container.classList.add('is-closing');
-		updateSidebarWidth(null);
 		container.addEventListener('animationend', () => {
 			container.remove();
-			highlighter.repositionHighlights();
 		}, { once: true });
 	}
 
@@ -72,8 +42,6 @@ declare global {
 			removeContainer(existingContainer);
 			return;
 		}
-
-		await ensureHighlighterCSS();
 
 		const container = document.createElement('div');
 		container.id = containerId;
@@ -109,10 +77,6 @@ declare global {
 		addResizeListener(container, southWestHandle, 'sw');
 
 		document.body.appendChild(container);
-		updateSidebarWidth(container);
-		container.addEventListener('animationend', () => {
-			highlighter.repositionHighlights();
-		}, { once: true });
 	}
 
 	function addResizeListener(container: HTMLElement, handle: HTMLElement, direction: string) {
@@ -136,13 +100,13 @@ declare global {
 	
 			document.onmousemove = (moveEvent) => {
 				if (!isResizing) return;
-
+	
 				const dx = moveEvent.clientX - startX;
 				const dy = moveEvent.clientY - startY;
 
 				const minWidth = parseInt(container.style.minWidth) || 200;
 				const minHeight = parseInt(container.style.minHeight) || 200;
-
+	
 				if (direction.includes('e')) {
 					let newWidth = startWidth + dx;
 					if (newWidth < minWidth) newWidth = minWidth;
@@ -170,8 +134,6 @@ declare global {
 					container.style.height = `${newHeight}px`;
 					container.style.top = `${newTop}px`;
 				}
-
-				updateSidebarWidth(container);
 			};
 	
 			document.onmouseup = () => {
@@ -183,8 +145,6 @@ declare global {
 				const newWidth = container.offsetWidth;
 				const newHeight = container.offsetHeight;
 				browser.storage.local.set({ clipperIframeWidth: newWidth, clipperIframeHeight: newHeight });
-
-				highlighter.repositionHighlights();
 
 				document.onmousemove = null;
 				document.onmouseup = null;
@@ -258,10 +218,24 @@ declare global {
 			return true;
 		}
 
+		if (request.action === "extractPageMarkdown") {
+			flattenShadowDom(document).then(() => {
+				try {
+					const defuddled = new Defuddle(document, { url: document.URL }).parse();
+					const markdown = createMarkdownContent(defuddled.content, document.URL);
+					sendResponse({ success: true, markdown, title: defuddled.title || document.title });
+				} catch (err) {
+					sendResponse({ success: false, error: (err as Error).message });
+				}
+			});
+			return true;
+		}
+
 		if (request.action === "copyMarkdownToClipboard") {
 			flattenShadowDom(document).then(() => {
 				try {
-					const defuddled = parseForClip(document);
+					// Extract page content using Defuddle
+					const defuddled = new Defuddle(document, { url: document.URL }).parse();
 
 					// Convert HTML content to markdown
 					const markdown = createMarkdownContent(defuddled.content, document.URL);
@@ -286,15 +260,20 @@ declare global {
 		if (request.action === "saveMarkdownToFile") {
 			flattenShadowDom(document).then(async () => {
 				try {
-					const defuddled = parseForClip(document);
+					const defuddled = new Defuddle(document, { url: document.URL }).parse();
 					const markdown = createMarkdownContent(defuddled.content, document.URL);
 					const title = defuddled.title || document.title || 'Untitled';
 					const fileName = title.replace(/[/\\?%*:|"<>]/g, '-');
+					let saveError: Error | null = null;
 					await saveFile({
 						content: markdown,
 						fileName,
 						mimeType: 'text/markdown',
+						onError: (error) => {
+							saveError = error;
+						}
 					});
+					if (saveError) throw saveError;
 					sendResponse({ success: true });
 				} catch (err) {
 					console.error('Failed to save markdown file:', err);
@@ -403,7 +382,7 @@ declare global {
 			const content = extractContentBySelector(request.selector, request.attribute, request.extractHtml);
 			sendResponse({ content: content });
 		} else if (request.action === "paintHighlights") {
-			ensureHighlighterCSS().then(() => highlighter.loadHighlights()).then(() => {
+			highlighter.loadHighlights().then(() => {
 				if (generalSettings.alwaysShowHighlights) {
 					highlighter.applyHighlights();
 				}
@@ -412,7 +391,6 @@ declare global {
 			return true;
 		} else if (request.action === "setHighlighterMode") {
 			isHighlighterMode = request.isActive;
-			ensureHighlighterCSS();
 			highlighter.toggleHighlighterMenu(isHighlighterMode);
 			updateHasHighlights();
 			sendResponse({ success: true });
@@ -421,61 +399,14 @@ declare global {
 			browser.runtime.sendMessage({ action: "getHighlighterMode" }).then(sendResponse);
 			return true;
 		} else if (request.action === "toggleHighlighter") {
-			ensureHighlighterCSS();
 			highlighter.toggleHighlighterMenu(request.isActive);
 			updateHasHighlights();
 			sendResponse({ success: true });
 		} else if (request.action === "highlightSelection") {
-			ensureHighlighterCSS();
 			highlighter.toggleHighlighterMenu(request.isActive);
 			const selection = window.getSelection();
 			if (selection && !selection.isCollapsed) {
 				highlighter.handleTextSelection(selection);
-			}
-			updateHasHighlights();
-			sendResponse({ success: true });
-		} else if (request.action === "highlightElement") {
-			ensureHighlighterCSS();
-			highlighter.toggleHighlighterMenu(request.isActive);
-			if (request.targetElementInfo) {
-				const { mediaType, srcUrl, pageUrl } = request.targetElementInfo;
-				
-				let elementToHighlight: Element | null = null;
-
-				// Function to compare URLs, handling both absolute and relative paths
-				const urlMatches = (elementSrc: string, targetSrc: string) => {
-					const elementUrl = new URL(elementSrc, pageUrl);
-					const targetUrl = new URL(targetSrc, pageUrl);
-					return elementUrl.href === targetUrl.href;
-				};
-
-				// Try to find the element using the src attribute
-				elementToHighlight = document.querySelector(`${mediaType}[src="${srcUrl}"]`);
-
-				// If not found, try with relative URL
-				if (!elementToHighlight) {
-					const relativeSrc = new URL(srcUrl).pathname;
-					elementToHighlight = document.querySelector(`${mediaType}[src="${relativeSrc}"]`);
-				}
-
-				// If still not found, iterate through all elements of the media type
-				if (!elementToHighlight) {
-					const elements = Array.from(document.getElementsByTagName(mediaType));
-					for (const el of elements) {
-						if (el instanceof HTMLImageElement || el instanceof HTMLVideoElement || el instanceof HTMLAudioElement) {
-							if (urlMatches(el.src, srcUrl)) {
-								elementToHighlight = el;
-								break;
-							}
-						}
-					}
-				}
-
-				if (elementToHighlight) {
-					highlighter.highlightElement(elementToHighlight);
-				} else {
-					console.warn('Could not find element to highlight. Info:', request.targetElementInfo);
-				}
 			}
 			updateHasHighlights();
 			sendResponse({ success: true });
@@ -493,8 +424,14 @@ declare global {
 					sendResponse({ isActive: false });
 				});
 			return true;
-		} else if (request.action === "getReaderModeState") {
-			sendResponse({ isActive: document.documentElement.classList.contains('obsidian-reader-active') });
+		} else if (request.action === "toggleReaderMode") {
+			// Forward the request to the background script to inject reader mode if needed
+			browser.runtime.sendMessage({ action: "toggleReaderMode", tabId: sender.tab?.id })
+				.then(sendResponse)
+				.catch(error => {
+					console.error("Error toggling reader mode:", error);
+					sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+				});
 			return true;
 		}
 		return true;
@@ -509,33 +446,14 @@ declare global {
 		browser.runtime.sendMessage({ action: "updateHasHighlights", hasHighlights });
 	}
 
-	let highlighterCSSPromise: Promise<void> | null = null;
-	function ensureHighlighterCSS(): Promise<void> {
-		if (!highlighterCSSPromise) {
-			highlighterCSSPromise = new Promise<void>((resolve) => {
-				const link = document.createElement('link');
-				link.rel = 'stylesheet';
-				link.href = browser.runtime.getURL('highlighter.css');
-				link.onload = () => resolve();
-				link.onerror = () => resolve();
-				(document.head || document.documentElement).appendChild(link);
-			});
-		}
-		return highlighterCSSPromise;
-	}
-
 	async function initializeHighlighter() {
 		await loadSettings();
-
-		if (generalSettings.alwaysShowHighlights) {
-			const result = await browser.storage.local.get('highlights');
-			const allHighlights = (result.highlights || {}) as Record<string, unknown>;
-			if (allHighlights[window.location.href]) {
-				await ensureHighlighterCSS();
-			}
-		}
-
 		await highlighter.loadHighlights();
+		
+		if (generalSettings.alwaysShowHighlights) {
+			highlighter.applyHighlights();
+		}
+		
 		updateHasHighlights();
 	}
 

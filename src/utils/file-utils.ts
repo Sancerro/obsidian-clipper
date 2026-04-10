@@ -80,9 +80,10 @@ export async function saveFile({
 			URL.revokeObjectURL(url);
 		}
 	} catch (error) {
-		console.error('Failed to save file:', error);
+		const normalizedError = error instanceof Error ? error : new Error(String(error));
+		console.error('Failed to save file:', normalizedError);
 		if (onError) {
-			onError(error as Error);
+			onError(normalizedError);
 		}
 	}
 } 

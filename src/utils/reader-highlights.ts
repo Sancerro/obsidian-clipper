@@ -4,7 +4,8 @@
  * Shared by both Obsidian-linked notes and regular reader-mode pages.
  */
 import browser from './browser-polyfill';
-import { pluginFetch } from './plugin-url';
+import { getPluginErrorMessage, pluginFetch } from './plugin-url';
+import { logHandledError } from './error-utils';
 
 // ── Types ────────────────────────────────────────────────
 
@@ -14,6 +15,14 @@ export interface ReaderHighlightData {
 	prefixText: string;
 	suffixText: string;
 }
+
+interface MarkClickHandlerOptions {
+	canRemove?: () => boolean;
+	onRemove: (highlightId: string) => void;
+	useCapture?: boolean;
+}
+
+const PENDING_REMOTE_REMOVALS_KEY = 'readerPendingRemoteRemovals';
 
 // ── Content root detection ───────────────────────────────
 
@@ -96,7 +105,17 @@ export function handleReaderModeHighlight(selection: Selection): void {
 			pluginFetch('/highlights/remove', {
 				method: 'POST',
 				body: { url, highlightId: oid }
-			}).catch(() => {});
+			}).then(res => {
+				if (!res.ok) {
+					queueRemoteHighlightRemoval(url, oid);
+					logHandledError('ReaderHighlightMergeRemove', res.error || 'Failed to remove merged highlight fragment', {
+						url,
+						highlightId: oid,
+						errorType: res.errorType,
+						status: res.status,
+					});
+				}
+			});
 		}
 		// Re-expand to word boundaries after merge
 		expandRangeToWordBoundaries(range);
@@ -128,10 +147,65 @@ export function handleReaderModeHighlight(selection: Selection): void {
 		method: 'POST',
 		body: { url, highlight: highlightData }
 	}).then(res => {
-		if (!res.ok && res.status === 0) showPluginOfflineToast();
-	}).catch(() => {
-		showPluginOfflineToast();
+		if (!res.ok) {
+			logHandledError('ReaderHighlightAdd', res.error || 'Failed to sync highlight add', {
+				url,
+				errorType: res.errorType,
+				status: res.status,
+			});
+			showPluginOfflineToast(getPluginErrorMessage('sync highlights', res));
+			return;
+		}
+		// If this URL isn't linked to a note yet, auto-clip the page on first highlight
+		const data = res.data as { notePath?: string | null };
+		if (!data?.notePath) {
+			autoClipPage(url).catch(err => {
+				logHandledError('AutoClip', err, { url });
+			});
+		}
 	});
+}
+
+/** Auto-clip the current page to Obsidian on the first highlight (if not already linked). */
+let autoClipInFlight = false;
+async function autoClipPage(url: string): Promise<void> {
+	if (autoClipInFlight) return;
+	autoClipInFlight = true;
+	try {
+		// Ask content script to extract markdown + title (content.ts handles Defuddle)
+		const extract = await browser.runtime.sendMessage({ action: 'extractPageMarkdown' }) as {
+			success: boolean;
+			markdown?: string;
+			title?: string;
+			error?: string;
+		};
+		if (!extract?.success || !extract.markdown) {
+			throw new Error(extract?.error || 'extract failed');
+		}
+
+		const title = (extract.title || document.title || 'Untitled').replace(/[/\\?%*:|"<>]/g, '-').trim() || 'Untitled';
+		const created = new Date().toISOString();
+		const fileContent = `---\ntitle: "${title.replace(/"/g, '\\"')}"\nsource: "${url}"\ncreated: ${created}\n---\n\n${extract.markdown}`;
+
+		const clipRes = await pluginFetch('/clip', {
+			method: 'POST',
+			body: {
+				fileContent,
+				noteName: title,
+				path: 'Clippings',
+				sourceUrl: url,
+				behavior: 'create',
+			}
+		});
+		if (!clipRes.ok) {
+			logHandledError('AutoClip', clipRes.error || 'Plugin /clip failed', { url, status: clipRes.status });
+			showPluginOfflineToast('Could not auto-clip page to Obsidian');
+		} else {
+			showPluginOfflineToast('Page auto-clipped to Obsidian');
+		}
+	} finally {
+		autoClipInFlight = false;
+	}
 }
 
 // ── Text extraction (skipping <sup> citation noise) ─────
@@ -460,6 +534,7 @@ function buildRangeFromOffset(root: Element, idx: number, endIdx: number): Range
 // ── Local persistence (serialized queue) ─────────────────
 
 let storageQueue: Promise<void> = Promise.resolve();
+let pendingRemovalFlushQueue: Promise<void> = Promise.resolve();
 
 function enqueue(fn: () => Promise<void>): void {
 	storageQueue = storageQueue.then(fn, fn);
@@ -506,6 +581,65 @@ export async function loadReaderHighlights(url: string): Promise<ReaderHighlight
 	const result = await browser.storage.local.get('readerHighlights') as Record<string, unknown>;
 	const all = (result.readerHighlights || {}) as Record<string, ReaderHighlightData[]>;
 	return all[url] || [];
+}
+
+function enqueuePendingRemovalWrite(
+	mutate: (pending: Record<string, string[]>) => void
+): void {
+	enqueue(async () => {
+		const result = await browser.storage.local.get(PENDING_REMOTE_REMOVALS_KEY) as Record<string, unknown>;
+		const pending = (result[PENDING_REMOTE_REMOVALS_KEY] || {}) as Record<string, string[]>;
+		mutate(pending);
+		await browser.storage.local.set({ [PENDING_REMOTE_REMOVALS_KEY]: pending });
+	});
+}
+
+export function queueRemoteHighlightRemoval(url: string, highlightId: string): void {
+	enqueuePendingRemovalWrite((pending) => {
+		const existing = pending[url] || [];
+		if (!existing.includes(highlightId)) {
+			existing.push(highlightId);
+			pending[url] = existing;
+		}
+	});
+}
+
+export async function flushPendingRemoteHighlightRemovals(url: string): Promise<void> {
+	pendingRemovalFlushQueue = pendingRemovalFlushQueue.then(async () => {
+		await drainStorageQueue();
+		const result = await browser.storage.local.get(PENDING_REMOTE_REMOVALS_KEY) as Record<string, unknown>;
+		const pending = (result[PENDING_REMOTE_REMOVALS_KEY] || {}) as Record<string, string[]>;
+		const queued = pending[url] || [];
+		if (queued.length === 0) return;
+
+		const remaining: string[] = [];
+		for (let i = 0; i < queued.length; i++) {
+			const highlightId = queued[i];
+			const res = await pluginFetch('/highlights/remove', {
+				method: 'POST',
+				body: { url, highlightId }
+			});
+			if (!res.ok) {
+				logHandledError('PendingHighlightRemoval', res.error || 'Failed to flush queued highlight removal', {
+					url,
+					highlightId,
+					errorType: res.errorType,
+					status: res.status,
+				});
+				remaining.push(...queued.slice(i));
+				break;
+			}
+		}
+
+		if (remaining.length > 0) {
+			pending[url] = remaining;
+		} else {
+			delete pending[url];
+		}
+		await browser.storage.local.set({ [PENDING_REMOTE_REMOVALS_KEY]: pending });
+	});
+
+	await pendingRemovalFlushQueue;
 }
 
 // ── Page-level highlight loading ─────────────────────────
@@ -614,6 +748,7 @@ export async function loadAndApplyPageHighlights(): Promise<void> {
 	}
 	const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
 	const root = findContentRoot();
+	await flushPendingRemoteHighlightRemovals(url);
 
 	// Merge plugin highlights (including highlights from linked Obsidian notes) with local ones
 	let pluginHighlights: ReaderHighlightData[] = [];
@@ -624,8 +759,16 @@ export async function loadAndApplyPageHighlights(): Promise<void> {
 			pluginOnline = true;
 			const data = res.data as { entry?: { highlights?: ReaderHighlightData[] } };
 			pluginHighlights = data.entry?.highlights ?? [];
+		} else {
+			logHandledError('PageHighlightLoad', res.error || 'Failed to load synced page highlights', {
+				url,
+				errorType: res.errorType,
+				status: res.status,
+			});
 		}
-	} catch { /* plugin offline */ }
+	} catch (error) {
+		logHandledError('PageHighlightLoad', error, { url });
+	}
 
 	const localHighlights = await loadReaderHighlights(url);
 	const seenIds = new Set(pluginHighlights.map(h => h.id));
@@ -642,12 +785,20 @@ export async function loadAndApplyPageHighlights(): Promise<void> {
 	// (covers the case where plugin was offline when highlights were created).
 	if (pluginOnline && localOnlyHighlights.length > 0) {
 		for (const lh of localOnlyHighlights) {
-			pluginFetch('/highlights/add', {
-				method: 'POST',
-				body: { url, highlight: lh }
-			}).catch(() => {});
+				pluginFetch('/highlights/add', {
+					method: 'POST',
+					body: { url, highlight: lh }
+				}).then(res => {
+					if (!res.ok) {
+						logHandledError('PageHighlightReconcile', res.error || 'Failed to sync local-only highlight', {
+							url,
+							highlightId: lh.id,
+							errorType: res.errorType,
+						});
+					}
+				});
+			}
 		}
-	}
 
 	// Diff existing marks against desired set — only remove deleted, only add new.
 	// Avoids flickering when an unrelated highlight is added elsewhere on the page.
@@ -706,6 +857,29 @@ function applyHighlightMarks(root: Element, highlights: ReaderHighlightData[]): 
 	return applied;
 }
 
+export function attachMarkClickHandler(root: Document | Element, options: MarkClickHandlerOptions): () => void {
+	const handleClick = (e: Event) => {
+		if (options.canRemove && !options.canRemove()) return;
+
+		const target = e.target as Element | null;
+		if (!target) return;
+
+		const mark = target.closest?.('.reading-selection-highlight-mark');
+		if (!mark) return;
+
+		const clickedLink = target.closest?.('a[href]');
+		if (clickedLink && mark.contains(clickedLink)) return;
+
+		const highlightId = (mark as HTMLElement).dataset.highlightId;
+		if (!highlightId) return;
+
+		options.onRemove(highlightId);
+	};
+
+	root.addEventListener('click', handleClick, options.useCapture);
+	return () => root.removeEventListener('click', handleClick, options.useCapture);
+}
+
 /** Wire delegated click-to-remove on page marks (call once). */
 let pageMarkClickWired = false;
 export function wirePageMarkClickHandlers(): void {
@@ -713,17 +887,10 @@ export function wirePageMarkClickHandlers(): void {
 	pageMarkClickWired = true;
 
 	// Use capturing phase so clicks reach us even when disableLinkClicks() uses stopPropagation
-	document.addEventListener('click', (e: Event) => {
-		// Only remove when highlighter is active
-		if (!document.body.classList.contains('obsidian-highlighter-active')) return;
-
-		const target = e.target as Element;
-		const mark = target.closest?.('.reading-selection-highlight-mark');
-		if (!mark) return;
-
-		const highlightId = (mark as HTMLElement).dataset.highlightId;
-		if (!highlightId) return;
-
+	attachMarkClickHandler(document, {
+		canRemove: () => document.body.classList.contains('obsidian-highlighter-active'),
+		useCapture: true,
+		onRemove: (highlightId) => {
 		// Remove all spans with this highlight ID
 		document.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${highlightId}"]`).forEach(m => {
 			m.replaceWith(...Array.from(m.childNodes));
@@ -736,8 +903,18 @@ export function wirePageMarkClickHandlers(): void {
 		pluginFetch('/highlights/remove', {
 			method: 'POST',
 			body: { url, highlightId }
-		}).catch(() => {});
-	}, true);
+		}).then(res => {
+			if (!res.ok) {
+				queueRemoteHighlightRemoval(url, highlightId);
+				logHandledError('PageHighlightRemove', res.error || 'Failed to remove highlight from plugin', {
+					url,
+					highlightId,
+					errorType: res.errorType,
+				});
+			}
+		});
+		}
+	});
 }
 
 // ── Orphaned highlights notification ─────────────────────
@@ -769,7 +946,16 @@ function showOrphanedHighlightsToast(orphaned: ReaderHighlightData[], url: strin
 			pluginFetch('/highlights/remove', {
 				method: 'POST',
 				body: { url, highlightId: h.id }
-			}).catch(() => {});
+			}).then(res => {
+				if (!res.ok) {
+					queueRemoteHighlightRemoval(url, h.id);
+					logHandledError('OrphanHighlightRemove', res.error || 'Failed to remove orphaned highlight from plugin', {
+						url,
+						highlightId: h.id,
+						errorType: res.errorType,
+					});
+				}
+			});
 		}
 		toast.style.opacity = '0';
 		setTimeout(() => toast.remove(), 300);
@@ -791,13 +977,13 @@ function showOrphanedHighlightsToast(orphaned: ReaderHighlightData[], url: strin
 
 // ── Toast ────────────────────────────────────────────────
 
-function showPluginOfflineToast(): void {
+function showPluginOfflineToast(message = 'Obsidian plugin not running — highlights won\'t sync'): void {
 	const existing = document.getElementById('obsidian-plugin-toast');
 	if (existing) return;
 
 	const toast = document.createElement('div');
 	toast.id = 'obsidian-plugin-toast';
-	toast.textContent = 'Obsidian plugin not running — highlights won\'t sync';
+	toast.textContent = message;
 	toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#e0e0e0;padding:8px 16px;border-radius:8px;font:13px/1.4 system-ui,sans-serif;z-index:999999999;opacity:0;transition:opacity 0.3s;pointer-events:none;';
 	document.body.appendChild(toast);
 	requestAnimationFrame(() => { toast.style.opacity = '1'; });

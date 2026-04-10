@@ -23,6 +23,7 @@ import { sanitizeFileName } from '../utils/string-utils';
 import { saveFile } from '../utils/file-utils';
 import { translatePage, getMessage, setupLanguageAndDirection } from '../utils/i18n';
 import { formatPropertyValue } from '../utils/shared';
+import { getUserFacingError } from '../utils/error-utils';
 
 interface ReaderModeResponse {
 	success: boolean;
@@ -599,11 +600,15 @@ async function initializeUI() {
 }
 
 function showError(messageKey: string): void {
+	showErrorMessage(getMessage(messageKey));
+}
+
+function showErrorMessage(message: string): void {
 	const errorMessage = document.querySelector('.error-message') as HTMLElement;
 	const clipper = document.querySelector('.clipper') as HTMLElement;
 
 	if (errorMessage && clipper) {
-		errorMessage.textContent = getMessage(messageKey);
+		errorMessage.textContent = message;
 		errorMessage.style.display = 'flex';
 		clipper.style.display = 'none';
 
@@ -624,7 +629,7 @@ function clearError(): void {
 
 function logError(message: string, error?: any): void {
 	console.error(message, error);
-	showError(message);
+	showErrorMessage(message);
 }
 
 async function waitForInterpreter(interpretBtn: HTMLButtonElement): Promise<void> {
@@ -1238,13 +1243,17 @@ async function handleSaveToDownloads() {
 		const frontmatter = await generateFrontmatter(properties);
 		const fileContent = frontmatter + noteContentField.value;
 
+		let saveError: Error | null = null;
 		await saveFile({
 			content: fileContent,
 			fileName,
 			mimeType: 'text/markdown',
 			tabId: currentTabId,
-			onError: (error) => showError('failedToSaveFile')
+			onError: (error) => {
+				saveError = error;
+			}
 		});
+		if (saveError) throw saveError;
 
 		const tabInfo = await getCurrentTabInfo();
 		await incrementStat('saveFile', vault, path, tabInfo.url, tabInfo.title);
@@ -1255,7 +1264,7 @@ async function handleSaveToDownloads() {
 		}
 	} catch (error) {
 		console.error('Failed to save file:', error);
-		showError('failedToSaveFile');
+		showErrorMessage(getUserFacingError(error, getMessage('failedToSaveFile')));
 	}
 }
 
@@ -1344,7 +1353,7 @@ async function handleClipObsidian(): Promise<void> {
 		}
 	} catch (error) {
 		console.error('Error in handleClipObsidian:', error);
-		showError('failedToSaveFile');
+		showErrorMessage(getUserFacingError(error, getMessage('failedToSaveFile')));
 		throw error;
 	}
 }

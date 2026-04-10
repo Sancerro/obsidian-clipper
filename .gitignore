@@ -26,4 +26,6 @@ context/
 
 # Custom signing
 sign.sh
+release.sh
 web-ext-artifacts/
+*.xpi
