@@ -2,8 +2,6 @@ import { describe, test, expect, vi, beforeAll, afterAll } from 'vitest';
 import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, basename, extname } from 'path';
 import { parseHTML } from 'linkedom';
-import DefuddleClass from 'defuddle';
-import { createMarkdownContent } from 'defuddle/full';
 import { buildVariables, generateFrontmatter, formatPropertyValue } from './shared';
 import { compileTemplate } from './template-compiler';
 import { createAsyncResolver, createSelectorProcessor } from '../api';
@@ -13,9 +11,77 @@ import { createAsyncResolver, createSelectorProcessor } from '../api';
 // ---------------------------------------------------------------------------
 
 const FROZEN_DATE = new Date('2025-01-15T12:00:00Z');
+const ORIGINAL_TZ = process.env.TZ;
 
-beforeAll(() => { vi.useFakeTimers({ now: FROZEN_DATE }); });
-afterAll(() => { vi.useRealTimers(); });
+type DefuddleModule = typeof import('defuddle');
+type DefuddleFullModule = typeof import('defuddle/full');
+
+let defuddleModulesPromise: Promise<{
+	DefuddleClass: DefuddleModule['default'];
+	createMarkdownContent: DefuddleFullModule['createMarkdownContent'];
+}> | null = null;
+
+function attachDocumentImplementation(doc: Document): Document {
+	const docWithImplementation = doc as any;
+	if (!docWithImplementation.implementation) {
+		docWithImplementation.implementation = {
+			createHTMLDocument: () => attachDocumentImplementation(
+				parseHTML('<!DOCTYPE html><html><head></head><body></body></html>').document as unknown as Document
+			),
+		};
+	}
+	return doc;
+}
+
+function ensureDefuddleGlobals(): void {
+	const globalScope = globalThis as any;
+
+	const domParser = function(this: { parseFromString?: (html: string) => Document }) {
+		this.parseFromString = (html: string) =>
+			attachDocumentImplementation(parseHTML(html).document as unknown as Document);
+	} as unknown as typeof DOMParser;
+
+	if (!globalScope.window) {
+		globalScope.window = globalScope;
+	}
+	if (!globalScope.DOMParser) {
+		globalScope.DOMParser = domParser;
+	}
+	if (!globalScope.window.DOMParser) {
+		globalScope.window.DOMParser = domParser;
+	}
+	if (!globalScope.document) {
+		globalScope.document = attachDocumentImplementation(
+			parseHTML('<!DOCTYPE html><html><head></head><body></body></html>').document as unknown as Document
+		);
+	}
+}
+
+async function getDefuddleModules(): Promise<{
+	DefuddleClass: DefuddleModule['default'];
+	createMarkdownContent: DefuddleFullModule['createMarkdownContent'];
+}> {
+	ensureDefuddleGlobals();
+	if (!defuddleModulesPromise) {
+		defuddleModulesPromise = Promise.all([
+			import('defuddle'),
+			import('defuddle/full'),
+		]).then(([defuddleModule, fullModule]) => ({
+			DefuddleClass: defuddleModule.default,
+			createMarkdownContent: fullModule.createMarkdownContent,
+		}));
+	}
+	return defuddleModulesPromise;
+}
+
+beforeAll(() => {
+	process.env.TZ = 'America/Los_Angeles';
+	vi.useFakeTimers({ now: FROZEN_DATE });
+});
+afterAll(() => {
+	vi.useRealTimers();
+	process.env.TZ = ORIGINAL_TZ;
+});
 
 // ---------------------------------------------------------------------------
 // Fixture types
@@ -29,6 +95,7 @@ interface FixtureTemplate {
 
 async function runFixture(html: string, url: string, template: FixtureTemplate): Promise<string> {
 	const { document } = parseHTML(html);
+	const { DefuddleClass, createMarkdownContent } = await getDefuddleModules();
 
 	// Run defuddle — same as CLI
 	const defuddle = new DefuddleClass(document as unknown as Document, { url });
