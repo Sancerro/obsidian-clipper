@@ -44,8 +44,14 @@ export const PLUGIN_BASE_URL = 'http://localhost:27124';
 /** The article URL our fixture server serves the test HTML on. */
 export const TEST_ARTICLE_URL = 'http://127.0.0.1:3100/article.html';
 
-/** Vault path of the note we clip during suite setup; linked to TEST_ARTICLE_URL. */
+/** A second linked note for transcript / video / player UI tests. */
+export const TEST_TRANSCRIPT_URL = 'http://127.0.0.1:3100/transcript.html';
+
+/** Vault path of the main article note. */
 export const TEST_NOTE_PATH = 'E2E/e2e-test-fixture.md';
+
+/** Vault path of the transcript fixture note. */
+export const TEST_TRANSCRIPT_NOTE_PATH = 'E2E/e2e-transcript-fixture.md';
 
 const TEST_NOTE_MARKDOWN =
 	'# The fixture article\n\n' +
@@ -54,6 +60,36 @@ const TEST_NOTE_MARKDOWN =
 	'Crazy Fredrick bought many very exquisite opal jewels. A mad boxer shot a quick, gloved jab to the jaw of his dizzy opponent.\n\n' +
 	'Read more about [linked foxes](#link-target) at the end of this article.\n\n' +
 	'This is where the link points to.\n';
+
+// Transcript note: raw HTML passes through Obsidian's markdown renderer
+// unchanged (verified: classes + data-timestamp + attrs all preserved).
+// 30 segments every 5 seconds; video points at the silent.mp4 fixture.
+function buildTranscriptMarkdown(): string {
+	const segments: string[] = [];
+	for (let i = 0; i < 30; i++) {
+		const time = i * 5;
+		const mm = Math.floor(time / 60);
+		const ss = (time % 60).toString().padStart(2, '0');
+		const pad = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. ' +
+			'Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.';
+		segments.push(
+			`<div class="transcript-segment">` +
+				`<strong><span class="timestamp" data-timestamp="${time}">${mm}:${ss}</span></strong>` +
+				` · Segment ${i} — ${pad}` +
+			`</div>`
+		);
+	}
+	return (
+		'# Transcript Fixture\n\n' +
+		'<div class="reader-video-wrapper">' +
+			'<video class="reader-video-player" muted playsinline preload="auto" ' +
+				'src="http://127.0.0.1:3100/silent.mp4"></video>' +
+		'</div>\n\n' +
+		'<section class="youtube transcript">\n' +
+			segments.join('\n') + '\n' +
+		'</section>\n'
+	);
+}
 
 export class RealPluginClient {
 	constructor(private baseUrl: string = PLUGIN_BASE_URL) {}
@@ -103,25 +139,52 @@ export class RealPluginClient {
 		return (await res.json()) as PageResponse;
 	}
 
-	/** Ensure the test note exists in the vault, linked to TEST_ARTICLE_URL. */
+	/** Ensure the main article note and the transcript note both exist. */
 	async ensureTestNote(): Promise<void> {
-		const page = await this.page(TEST_ARTICLE_URL);
-		if (page.notePath) return; // already there
-		const res = await fetch(`${this.baseUrl}/clip`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				fileContent:
-					`---\nsource: "${TEST_ARTICLE_URL}"\ntitle: "E2E Fixture"\n---\n\n` +
-					TEST_NOTE_MARKDOWN,
-				noteName: 'e2e-test-fixture',
-				path: 'E2E',
-				sourceUrl: TEST_ARTICLE_URL,
-				behavior: 'create',
-			}),
-		});
-		if (!res.ok) throw new Error(`ensureTestNote /clip failed: ${res.status}`);
-		// Give the plugin a beat to reindex frontmatter
-		await new Promise((r) => setTimeout(r, 500));
+		const [article, transcript] = await Promise.all([
+			this.page(TEST_ARTICLE_URL),
+			this.page(TEST_TRANSCRIPT_URL),
+		]);
+		const jobs: Array<Promise<unknown>> = [];
+		if (!article.notePath) {
+			jobs.push(fetch(`${this.baseUrl}/clip`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					fileContent:
+						`---\nsource: "${TEST_ARTICLE_URL}"\ntitle: "E2E Fixture"\n---\n\n` +
+						TEST_NOTE_MARKDOWN,
+					noteName: 'e2e-test-fixture',
+					path: 'E2E',
+					sourceUrl: TEST_ARTICLE_URL,
+					behavior: 'create',
+				}),
+			}));
+		}
+		if (!transcript.notePath) {
+			jobs.push(fetch(`${this.baseUrl}/clip`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					fileContent:
+						`---\nsource: "${TEST_TRANSCRIPT_URL}"\ntitle: "E2E Transcript Fixture"\n---\n\n` +
+						buildTranscriptMarkdown(),
+					noteName: 'e2e-transcript-fixture',
+					path: 'E2E',
+					sourceUrl: TEST_TRANSCRIPT_URL,
+					behavior: 'create',
+				}),
+			}));
+		}
+		if (jobs.length > 0) {
+			const results = await Promise.all(jobs);
+			for (const res of results) {
+				if (res instanceof Response && !res.ok) {
+					throw new Error(`ensureTestNote /clip failed: ${res.status}`);
+				}
+			}
+			// Give the plugin a beat to reindex frontmatter
+			await new Promise((r) => setTimeout(r, 600));
+		}
 	}
 }

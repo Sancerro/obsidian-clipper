@@ -1,6 +1,7 @@
 import { test, expect } from './test-fixture';
 import type { Page, BrowserContext, Worker, Route } from '@playwright/test';
 import type { Highlight } from './real-plugin';
+import { TEST_TRANSCRIPT_URL } from './real-plugin';
 
 // Budget for a single propagation cycle against the REAL plugin. Generous
 // because the plugin writes highlight state to disk on every mutation, so
@@ -679,67 +680,18 @@ test('offline: highlight created while plugin is unreachable gets pushed on relo
 });
 
 // ── Transcript auto-scroll ───────────────────────────────
-
-/**
- * Build a reader-mode article body containing a native <video> element
- * pointed at a real, silent, seekable test MP4 plus a `.youtube.transcript`
- * block with timed segments. Exactly the shape Reader.apply → wireTranscript
- * expects.
- */
-function makeTranscriptNoteContent(): string {
-	const segments: string[] = [];
-	for (let i = 0; i < 30; i++) {
-		const time = i * 5; // segments every 5 seconds
-		const mm = Math.floor(time / 60);
-		const ss = (time % 60).toString().padStart(2, '0');
-		const pad = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. ' +
-			'Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.';
-		segments.push(
-			`<div class="transcript-segment">` +
-				`<strong><span class="timestamp" data-timestamp="${time}">${mm}:${ss}</span></strong>` +
-				` · Segment ${i} — ${pad}` +
-			`</div>`
-		);
-	}
-	return (
-		'<article>' +
-			'<h1>Transcript Fixture</h1>' +
-			'<div class="reader-video-wrapper">' +
-				'<video class="reader-video-player" muted playsinline preload="auto" ' +
-					'src="http://127.0.0.1:3100/silent.mp4"></video>' +
-			'</div>' +
-			'<section class="youtube transcript">' +
-				segments.join('') +
-			'</section>' +
-		'</article>'
-	);
-}
+//
+// All transcript tests use a REAL linked note in the vault
+// (E2E/e2e-transcript-fixture.md → TEST_TRANSCRIPT_URL). The note's
+// markdown contains raw HTML for the transcript section and a <video>
+// pointing at the silent.mp4 fixture; Obsidian's markdown renderer passes
+// the HTML (classes, data-timestamp) through unchanged, and reader mode
+// fetches it via the real /page endpoint. No mocks.
 
 test('auto-scroll: transcript segment advance scrolls the page', async ({
-	page, context, articleUrl,
+	page,
 }) => {
-	// Mock the plugin's /page endpoint so reader mode renders our
-	// hand-crafted transcript content. All other plugin endpoints still go
-	// to the real plugin. The fixture's <video> points at a real
-	// 150-second silent MP4 served from the fixture server, so seeking
-	// and timeupdate events are genuine — no prototype mocks, no synthetic
-	// event dispatch.
-	const fakeContent = makeTranscriptNoteContent();
-	await context.route('**/localhost:27124/page**', async (route) => {
-		await route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({
-				ok: true,
-				notePath: 'E2E/auto-scroll-fixture.md',
-				title: 'Auto-scroll Fixture',
-				content: fakeContent,
-				noteModified: Date.now(),
-			}),
-		});
-	});
-
-	await page.goto(articleUrl);
+	await page.goto(TEST_TRANSCRIPT_URL);
 	await enterReaderMode(page);
 	await page.waitForSelector('.youtube.transcript .transcript-segment');
 
@@ -794,29 +746,14 @@ test('auto-scroll: transcript segment advance scrolls the page', async ({
 });
 
 test('auto-scroll: sustained across the AUTO_SCROLL_COOLDOWN window', async ({
-	page, context, articleUrl,
+	page,
 }) => {
 	// Regression test for the cooldown-lockup bug: after the first auto-scroll
 	// a late scroll event could slip past the `programmaticScroll` flag,
 	// bump `lastUserScroll = Date.now()`, and poison the next 2000ms cooldown.
 	// Fix switched from a boolean flag + setTimeout to a
 	// `programmaticScrollUntil` timestamp with a generous 500ms grace window.
-	const fakeContent = makeTranscriptNoteContent();
-	await context.route('**/localhost:27124/page**', async (route) => {
-		await route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({
-				ok: true,
-				notePath: 'E2E/auto-scroll-fixture.md',
-				title: 'Auto-scroll Fixture',
-				content: fakeContent,
-				noteModified: Date.now(),
-			}),
-		});
-	});
-
-	await page.goto(articleUrl);
+	await page.goto(TEST_TRANSCRIPT_URL);
 	await enterReaderMode(page);
 	await page.waitForFunction(() => {
 		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement | null;
@@ -862,24 +799,9 @@ test('auto-scroll: sustained across the AUTO_SCROLL_COOLDOWN window', async ({
 });
 
 test('pin player: no ancestor breaks sticky, and the player stays pinned during auto-scroll', async ({
-	page, context, articleUrl,
+	page,
 }) => {
-	const fakeContent = makeTranscriptNoteContent();
-	await context.route('**/localhost:27124/page**', async (route) => {
-		await route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify({
-				ok: true,
-				notePath: 'E2E/auto-scroll-fixture.md',
-				title: 'Pin Fixture',
-				content: fakeContent,
-				noteModified: Date.now(),
-			}),
-		});
-	});
-
-	await page.goto(articleUrl);
+	await page.goto(TEST_TRANSCRIPT_URL);
 	await enterReaderMode(page);
 	await page.waitForSelector('.player-container');
 	await page.waitForFunction(() => {
@@ -947,6 +869,183 @@ test('pin player: no ancestor breaks sticky, and the player stays pinned during 
 	expect(playerAfterScroll.top).toBeLessThan(20);
 	expect(playerAfterScroll.bottom).toBeGreaterThan(0);
 });
+
+// ── Tier 1: transcript interaction + exit reader + undo/redo ──
+
+test('transcript segment click seeks the video to that timestamp', async ({
+	page,
+}) => {
+	await page.goto(TEST_TRANSCRIPT_URL);
+	await enterReaderMode(page);
+	await page.waitForFunction(() => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement | null;
+		return !!v && v.readyState >= 1 && v.duration > 60;
+	}, { timeout: 5000 });
+
+	// Reader mode auto-enables highlighter (`reader.ts:2327`), and the
+	// transcript's click handler early-returns when `obsidian-highlighter-active`
+	// is on body — click-to-seek only works when the user isn't mid-highlight.
+	// Drop the class directly so the click lands in the seek path.
+	await page.evaluate(() => {
+		document.body.classList.remove('obsidian-highlighter-active');
+	});
+
+	// wireTranscript's delegated click handler computes the target time from
+	// the segment's startTime. For a single click at the start of a segment
+	// with no caret position, caret offset falls back to totalLen, mapping
+	// to progress=1 and a seek close to the segment's END. Click BEFORE the
+	// segment at t=60 (segment 12) to land near t=60 itself: the segment
+	// with data-timestamp="55" has end=60, so clicking it with no caret seeks
+	// to 60.
+	await page.evaluate(async () => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement;
+		const target = Array.from(document.querySelectorAll('.transcript-segment'))
+			.find(seg => seg.querySelector('.timestamp')?.getAttribute('data-timestamp') === '55') as HTMLElement;
+		if (!target) throw new Error('segment at t=55 not found');
+		const seeked = new Promise<void>(resolve => {
+			v.addEventListener('seeked', () => resolve(), { once: true });
+		});
+		target.click();
+		await seeked;
+	});
+
+	const currentTime = await page.evaluate(() => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement;
+		return v.currentTime;
+	});
+	// Target was segment start=55, end=60. A click without a caret hits
+	// progress=1 → seekTo(60). Allow a small rounding tolerance.
+	expect(currentTime).toBeGreaterThanOrEqual(59);
+	expect(currentTime).toBeLessThanOrEqual(61);
+});
+
+test('player toggles: clicking pin/auto-scroll/highlight-line flips state live', async ({
+	page,
+}) => {
+	await page.goto(TEST_TRANSCRIPT_URL);
+	await enterReaderMode(page);
+	await page.waitForSelector('.player-toggles .player-toggle');
+
+	// Initial state: all three toggles are on (default settings).
+	const initial = await page.evaluate(() => {
+		const toggles = Array.from(document.querySelectorAll('.player-toggle')) as HTMLElement[];
+		return toggles.map(t => ({
+			label: t.querySelector('span')?.textContent,
+			enabled: t.classList.contains('is-enabled'),
+		}));
+	});
+	expect(initial).toHaveLength(3);
+	expect(initial.every(t => t.enabled)).toBe(true);
+	// Player container has pin-player class by default.
+	const pinnedInitially = await page.evaluate(() =>
+		document.querySelector('.player-container')?.classList.contains('pin-player')
+	);
+	expect(pinnedInitially).toBe(true);
+
+	// Click the pin toggle — should remove pin-player class from container.
+	await page.evaluate(() => {
+		const toggles = Array.from(document.querySelectorAll('.player-toggle')) as HTMLElement[];
+		const pinToggle = toggles.find(t => t.querySelector('span')?.textContent?.toLowerCase().includes('pin'));
+		pinToggle?.click();
+	});
+	await page.waitForFunction(() =>
+		!document.querySelector('.player-container')?.classList.contains('pin-player')
+	, { timeout: 1000 });
+	const pinnedAfterClick = await page.evaluate(() =>
+		document.querySelector('.player-container')?.classList.contains('pin-player')
+	);
+	expect(pinnedAfterClick).toBe(false);
+
+	// Toggle it back on.
+	await page.evaluate(() => {
+		const toggles = Array.from(document.querySelectorAll('.player-toggle')) as HTMLElement[];
+		const pinToggle = toggles.find(t => t.querySelector('span')?.textContent?.toLowerCase().includes('pin'));
+		pinToggle?.click();
+	});
+	await page.waitForFunction(() =>
+		document.querySelector('.player-container')?.classList.contains('pin-player')
+	, { timeout: 1000 });
+
+	// Click auto-scroll toggle — should remove is-enabled from that toggle.
+	// (The effect is internal to wireTranscript's autoScrollEnabled closure;
+	// the `.is-enabled` class reflection is the only externally visible hint.)
+	const autoScrollState = await page.evaluate(() => {
+		const toggles = Array.from(document.querySelectorAll('.player-toggle')) as HTMLElement[];
+		const autoScrollToggle = toggles.find(t => t.querySelector('span')?.textContent?.toLowerCase().includes('auto'));
+		autoScrollToggle?.click();
+		return autoScrollToggle?.classList.contains('is-enabled');
+	});
+	expect(autoScrollState).toBe(false);
+
+	// Click highlight-line toggle — same pattern.
+	const highlightState = await page.evaluate(() => {
+		const toggles = Array.from(document.querySelectorAll('.player-toggle')) as HTMLElement[];
+		const highlightToggle = toggles.find(t => t.querySelector('span')?.textContent?.toLowerCase().includes('highlight'));
+		highlightToggle?.click();
+		return highlightToggle?.classList.contains('is-enabled');
+	});
+	expect(highlightState).toBe(false);
+});
+
+test('exit reader mode: restores the original page DOM and removes reader chrome', async ({
+	page, articleUrl,
+}) => {
+	await page.goto(articleUrl);
+
+	// Sanity: the original fixture page has #p1 / #p2 / #p3 paragraphs.
+	const beforeReader = await page.evaluate(() => ({
+		hasP1: !!document.getElementById('p1'),
+		hasP2: !!document.getElementById('p2'),
+		readerClass: document.documentElement.classList.contains('obsidian-reader-active'),
+	}));
+	expect(beforeReader.hasP1).toBe(true);
+	expect(beforeReader.readerClass).toBe(false);
+
+	await enterReaderMode(page);
+	const duringReader = await page.evaluate(() => ({
+		readerClass: document.documentElement.classList.contains('obsidian-reader-active'),
+		hasReaderContainer: !!document.querySelector('.obsidian-reader-container'),
+		hasArticle: !!document.querySelector('article'),
+	}));
+	expect(duringReader.readerClass).toBe(true);
+	expect(duringReader.hasReaderContainer).toBe(true);
+
+	// Toggle reader mode off via the same service-worker path reader uses.
+	const sw = await getServiceWorker(page.context());
+	const tabId = await sw.evaluate(async () => {
+		const tabs = await (globalThis as any).chrome.tabs.query({ active: true, currentWindow: true });
+		return tabs[0]?.id ?? null;
+	});
+	await sw.evaluate(async (id) => {
+		await (globalThis as any).chrome.tabs.sendMessage(id, { action: 'toggleReaderMode' });
+	}, tabId);
+
+	// Reader.restore replaces doc.documentElement with the original HTML via
+	// doc.replaceChild, then navigation is needed to re-run scripts. Wait for
+	// the reader class to go away AND the original #p1 paragraph to reappear.
+	await page.waitForFunction(() => {
+		return !document.documentElement.classList.contains('obsidian-reader-active')
+			&& !!document.getElementById('p1');
+	}, { timeout: 5000 });
+
+	const afterReader = await page.evaluate(() => ({
+		readerClass: document.documentElement.classList.contains('obsidian-reader-active'),
+		hasReaderContainer: !!document.querySelector('.obsidian-reader-container'),
+		hasP1: !!document.getElementById('p1'),
+		hasP2: !!document.getElementById('p2'),
+	}));
+	expect(afterReader.readerClass).toBe(false);
+	expect(afterReader.hasReaderContainer).toBe(false);
+	expect(afterReader.hasP1).toBe(true);
+	expect(afterReader.hasP2).toBe(true);
+});
+
+// Undo / redo (Cmd+Z / Cmd+Shift+Z) intentionally NOT tested:
+// `highlighter.ts#handleKeyDown` binds these to `undo()` / `redo()` in the
+// LEGACY XPath highlight system. The text-anchor mark flow used by everything
+// real (reader-highlights.ts) has no history stack, so Cmd+Z is a silent
+// no-op for any highlight created in the current architecture. Writing a
+// test against behavior that doesn't exist would just codify the gap.
 
 test('multi-highlight: removing one highlight leaves the others intact', async ({
 	page, articleUrl, realPlugin,
