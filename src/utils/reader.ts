@@ -12,6 +12,7 @@ import { copyToClipboard } from './clipboard-utils';
 import { getMessage, initializeI18n } from './i18n';
 import { getFontCss } from './font-utils';
 import { logHandledError } from './error-utils';
+import { wireTranscript } from './reader-transcript';
 
 function showPluginStatusToast(connected: boolean): void {
 	const existing = document.getElementById('obsidian-plugin-toast');
@@ -39,7 +40,9 @@ import { ReaderSettings } from '../types/types';
 
 export class Reader {
 	private static originalHTML: string | null = null;
+	private static hasApplied: boolean = false;
 	private static isActive: boolean = false;
+	private static programmaticScroll: boolean = false;
 	private static readerHighlightSync: HighlightSync | null = null;
 	private static currentNoteUrl: string | null = null;
 	private static pluginStatusShown: boolean = false;
@@ -696,19 +699,31 @@ export class Reader {
 		}
 	}
 
+	private static getStickyOffset(): number {
+		const player = document.querySelector('.pin-player') as HTMLElement | null;
+		if (player) return player.getBoundingClientRect().height + 16;
+		const toggles = document.querySelector('article > .player-toggles') as HTMLElement | null;
+		if (toggles) return toggles.getBoundingClientRect().height + 32;
+		return 0;
+	}
 
 	private static scrollTo(targetY: number, duration = 200): void {
 		const startY = window.pageYOffset;
 		const distance = targetY - startY;
 		if (Math.abs(distance) < 1) return;
 		const startTime = performance.now();
+		this.programmaticScroll = true;
 
 		const step = (now: number) => {
 			const elapsed = now - startTime;
 			const t = Math.min(elapsed / duration, 1);
 			const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 			window.scrollTo(0, startY + distance * ease);
-			if (t < 1) requestAnimationFrame(step);
+			if (t < 1) {
+				requestAnimationFrame(step);
+			} else {
+				setTimeout(() => { Reader.programmaticScroll = false; }, 50);
+			}
 		};
 
 		requestAnimationFrame(step);
@@ -1875,8 +1890,10 @@ export class Reader {
 	}
 
 	static async apply(doc: Document) {
+		let resolveViewTransition: (() => void) | undefined;
 		try {
 			await initializeI18n();
+			this.hasApplied = true;
 
 			// Store original HTML for restoration
 			this.originalHTML = doc.documentElement.outerHTML;
@@ -1932,6 +1949,21 @@ export class Reader {
 			Object.defineProperty(docClone, 'URL', { value: doc.URL, configurable: true });
 			// Start content extraction on the clone (don't await yet)
 			const contentPromise = this.extractContent(docClone);
+
+			if ('startViewTransition' in document) {
+				await new Promise<void>(resolve => {
+					try {
+						const vt = (document as any).startViewTransition(() => {
+							resolve();
+							return new Promise<void>(r => { resolveViewTransition = r; });
+						});
+						vt.ready.catch(() => {});
+						vt.finished.catch(() => {});
+					} catch {
+						resolve();
+					}
+				});
+			}
 
 			// Clean up head - remove unwanted elements but keep meta tags and non-stylesheet links
 			const head = doc.head;
@@ -2079,6 +2111,9 @@ export class Reader {
 			this.colorSchemeMediaQuery.addEventListener('change', (e) => this.handleColorSchemeChange(e, doc));
 
 			this.isActive = true;
+			if (resolveViewTransition) {
+				resolveViewTransition();
+			}
 
 			// Now await content extraction and populate the page
 			const { content, title, author, published, domain, extractorType, wordCount, parseTime, notePath, noteModified, pageModified } = await contentPromise;
@@ -2240,6 +2275,21 @@ export class Reader {
 				article.appendChild(contentBody.firstChild);
 			}
 
+			// Preserve original article HTML before transcript wiring mutates the DOM.
+			const originalHtml = article.innerHTML.replace(
+				/<span class="timestamp"[^>]*>([^<]*)<\/span>/g, '$1'
+			);
+			article.setAttribute('data-original-html', originalHtml);
+
+			wireTranscript(doc, article, this.settings, {
+				getStickyOffset: () => this.getStickyOffset(),
+				scrollTo: (y) => this.scrollTo(y),
+				programmaticScroll: () => this.programmaticScroll,
+			}, (key, value) => {
+				(this.settings as any)[key] = value;
+				this.saveSettings();
+			});
+
 			// Set extractor type
 			if (extractorType) {
 				doc.documentElement.setAttribute('data-reader-extractor', extractorType);
@@ -2305,6 +2355,7 @@ export class Reader {
 
 		} catch (e) {
 			console.error('Reader', 'Error during apply:', e);
+			if (resolveViewTransition) resolveViewTransition();
 		}
 	}
 
