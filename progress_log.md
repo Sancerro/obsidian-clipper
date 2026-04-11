@@ -127,3 +127,34 @@ Codex identified responsibility and coupling issues. Refactored:
 - Initial reader entry still uses the existing rendered note HTML path, so Obsidian-linked notes continue to load from `/page` first with baked markup.
 - Preserved optimistic sync behavior by keeping unsettled pending adds in the DOM and suppressing re-adding unsettled pending removals until the plugin state catches up.
 - Skipped orphaned highlights when text anchoring fails during incremental sync instead of forcing a full article re-render.
+
+## 2026-04-11
+
+### E2E test suite for highlight sync
+- Added Playwright-based e2e infrastructure in `e2e/` covering all six ordered pairs of highlight propagation between Web page (W), Reader mode (R), and Obsidian (O):
+  - `e2e/fake-plugin.ts` — HTTP+SSE server mimicking the real plugin contract (`/health`, `/page`, `/highlights`, `/highlights/add`, `/highlights/remove`, `/highlights/stream`) with test hooks (`registerNote`, `injectHighlightFromObsidian`, `waitForClipperAdd`).
+  - `e2e/fixture-server.ts` + `e2e/fixtures/article.html` — static HTTP server on `:3100` so content_scripts can inject (file:// not matched by manifest).
+  - `e2e/test-fixture.ts` — Playwright test fixture that launches Chromium headed with the `dev/` extension via `--load-extension`, and uses `context.route('**/*')` to redirect all `:27124` traffic to the fake plugin on `:27125` so the real Obsidian plugin can keep running on `:27124` during tests.
+  - `e2e/sync.spec.ts` — the six tests. Latency measured from `page.mouse.up()` (for source actions) / `injectHighlightFromObsidian` (for Obsidian-origin) to the destination surface observing the change. All six complete in ~11s with every latency under the 100ms budget.
+- Decisions and abandoned paths:
+  - **Firefox first**: tried Playwright + `playwright-webextext` for Firefox extension loading. Worked for installing the extension, but `context.route()` does NOT intercept extension background-page fetches on Firefox, so transparent `:27124` → fake-plugin redirection wasn't possible. Would have required either (a) the user quitting Obsidian for every test run, or (b) hard-coding the fake plugin on 27124 which required a preflight and was fragile. Switched to Chrome.
+  - **Chrome routing**: `context.route()` DOES intercept extension service-worker fetches on Chromium, so the fake plugin lives on `:27125` and the real Obsidian plugin can stay up on `:27124`. Dropped the `playwright-webextext` dep.
+  - **Reader mode toggle**: `page.keyboard.press('Alt+Shift+R')` doesn't reliably trigger the browser-level extension command. Instead the test helper evaluates inside the extension service worker (`context.serviceWorkers()`) to call `chrome.scripting.executeScript` + `chrome.tabs.sendMessage` — replicating what the background's `toggle_reader` command handler does. Uses `page.bringToFront()` before querying `chrome.tabs.query({ active: true })` so the correct tab is targeted when multiple tabs share the same URL (R→W, W→R).
+  - **Highlighter toggle**: `page.keyboard.press('h')` works fine because `content.ts` has a plain-`h` keydown listener (not a browser-level command).
+  - **Latency measurement**: initial runs failed at 447ms because `dragSelect` timed the entire mouse-drag animation. Refactored so `dragSelect` stops before the mouseup and a separate `releaseDrag(page)` fires it; timer starts just before the release. This measures the actual propagation (mouseup → content script → pluginFetch → background → HTTP POST → fake plugin state), which is well under 100ms.
+  - **Headless**: initially ran headed because `--load-extension` is not supported by Playwright's bundled Chromium **headless shell**. Later switched to `channel: 'chromium'` + `headless: true`, which uses the full Chromium binary in new-headless mode and DOES support extensions. No more window popping up and stealing focus.
+- Added `build:chrome:dev` and `test:e2e` scripts. `test:e2e` builds the unminified `dev/` bundle and runs Playwright. No CI yet — run locally before touching highlight code.
+
+### Tier 1 e2e expansion: link-click regression tests + remove propagation
+- **Two production bugs found by the new tests** (both in `src/utils/reader-highlights.ts`):
+  1. **Link-guard direction was wrong** in `attachMarkClickHandler`. Existing code checked `mark.contains(clickedLink)` — only true when the mark wraps the link. But `wrapRangeInMarks` wraps individual text nodes, so selecting text inside a single `<a>` puts the mark INSIDE the link, not wrapping it, and the guard failed silently. Clicking a highlighted link deleted the highlight. Fix: replaced with `if (target.closest('a[href]')) return;` — covers all containment directions.
+  2. **Hash-only navigation wiped highlights**. `handleUrlChange` fired on any URL change (including in-page anchor clicks like `#section`), called `pageSync.update(newUrl)` with the hashed URL, and `loadAndApplyPageHighlights()` then fetched `/highlights?url=...#section` from the plugin. The plugin keys by base URL so it returned empty; the diff step in `loadAndApplyPageHighlights` saw "desired = {}, existing = {marks}" and removed all marks. Any internal anchor click killed every highlight on the page. Fix: added `lastSyncedPath` + `stripHash()` so `handleUrlChange` is a no-op when only the hash portion changed.
+- **Expanded e2e suite from 6 to 14 tests** — add and remove propagation for all six W/R/O ordered pairs, plus two link-click regression guards:
+  - `page+highlighter mode: clicking a highlighted link keeps the highlight (navigation blocked)` — validates both that `disableLinkClicks()` prevents navigation while highlighter is active AND the new link guard preserves the highlight.
+  - `reader mode: clicking a highlighted link navigates and keeps the highlight` — validates that reader mode (no disableLinkClicks) navigates normally, that the hash-nav fix keeps the highlight, and that the link guard fires in reader mode's `wireMarkClickHandlers` path too.
+- **New test helpers**:
+  - `programmaticSelectAndRelease()` — creates a selection spanning multiple text nodes (e.g. text that straddles an `<a>` boundary) via `window.getSelection()` + `document.dispatchEvent(mouseup)`. Needed for selections `dragSelect` can't handle with its single-text-node walker.
+  - `clickMarkById()` — dispatches a synthetic `click` event via `page.evaluate()` instead of `locator.click()`. The full locator click sequence (scroll, stability, hover, mousedown, mouseup) eats 300+ ms of CDP round-trips and blew the 100ms latency budget on remove tests. Synthetic dispatch is instant.
+  - `waitForMarkGone()` — mirror of `waitForMarkWithText` for the remove tests.
+- **Full suite runs in ~18s headless**, all 14 tests under the 100ms per-pair latency budget.
+- `.gitignore` now excludes `test-results/` and `playwright-report/`.

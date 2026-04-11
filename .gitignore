@@ -24,6 +24,11 @@ assets/shared
 .env
 context/
 
+# Playwright e2e artifacts
+test-results/
+playwright-report/
+/tmp/clipper-e2e*
+
 # Custom signing
 sign.sh
 release.sh
