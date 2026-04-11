@@ -696,14 +696,26 @@ export function subscribeHighlightChanges(url: string, onChange: () => void): Hi
 
 let pageSync: HighlightSync | null = null;
 let spaNavListenersInstalled = false;
+let lastSyncedPath = '';
 
 function normalizeUrl(): string {
 	return window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
 }
 
+function stripHash(url: string): string {
+	const i = url.indexOf('#');
+	return i === -1 ? url : url.slice(0, i);
+}
+
 function handleUrlChange(): void {
 	if (!pageSync) return;
 	const newUrl = normalizeUrl();
+	const newPath = stripHash(newUrl);
+	// Hash-only navigation (footnote link, in-page anchor) shouldn't re-sync —
+	// same document identity, plugin keys by base URL, and a pointless re-sync
+	// would diff against an empty result and wipe existing marks.
+	if (newPath === lastSyncedPath) return;
+	lastSyncedPath = newPath;
 	pageSync.update(newUrl);
 	loadAndApplyPageHighlights();
 }
@@ -711,6 +723,7 @@ function handleUrlChange(): void {
 /** Start SSE sync with the plugin for the current page. */
 export function startPageHighlightSync(): void {
 	if (pageSync) return;
+	lastSyncedPath = stripHash(normalizeUrl());
 	pageSync = subscribeHighlightChanges(normalizeUrl(), () => loadAndApplyPageHighlights());
 
 	// Watch for SPA navigation (pushState/replaceState/popstate)
@@ -867,8 +880,12 @@ export function attachMarkClickHandler(root: Document | Element, options: MarkCl
 		const mark = target.closest?.('.reading-selection-highlight-mark');
 		if (!mark) return;
 
-		const clickedLink = target.closest?.('a[href]');
-		if (clickedLink && mark.contains(clickedLink)) return;
+		// Let link clicks through. Any click whose target is inside <a[href]>
+		// should navigate (or, if highlighter mode blocks navigation via
+		// disableLinkClicks, do nothing) — it must never delete the highlight.
+		// Covers all containment directions: mark inside link, link inside
+		// mark, or range crossing element boundaries.
+		if (target.closest?.('a[href]')) return;
 
 		const highlightId = (mark as HTMLElement).dataset.highlightId;
 		if (!highlightId) return;
