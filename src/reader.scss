@@ -171,10 +171,14 @@
 	}
 
 	.obsidian-reader-content {
-		padding: max(4rem, 4vh) 0 0 !important;	
+		padding: max(4rem, 4vh) 0 0 !important;
 		width: var(--line-width);
 		max-width: calc(100vw - var(--sidebar-width));
-		overflow: hidden;
+		// `overflow: hidden` would create a scroll container that swallows
+		// the sticky behavior of `.player-container.pin-player` inside.
+		// `overflow: clip` clips the same way without establishing a scroll
+		// container, so sticky still sticks to the viewport top.
+		overflow: clip;
 		> article {
 			margin: 0 auto;
 			max-width: 100%;

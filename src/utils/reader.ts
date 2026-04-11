@@ -42,7 +42,7 @@ export class Reader {
 	private static originalHTML: string | null = null;
 	private static hasApplied: boolean = false;
 	private static isActive: boolean = false;
-	private static programmaticScroll: boolean = false;
+	private static programmaticScrollUntil: number = 0;
 	private static readerHighlightSync: HighlightSync | null = null;
 	private static currentNoteUrl: string | null = null;
 	private static pluginStatusShown: boolean = false;
@@ -712,18 +712,24 @@ export class Reader {
 		const distance = targetY - startY;
 		if (Math.abs(distance) < 1) return;
 		const startTime = performance.now();
-		this.programmaticScroll = true;
+		// Mark a window during which any scroll event is our own. Long enough
+		// to cover the animation duration AND any late scroll events the
+		// browser might dispatch after the last window.scrollTo call (scroll
+		// events are not always synchronous with the setter; the compositor
+		// can emit them a frame or two later). Without this grace, a late
+		// scroll event slips past programmaticScroll=false, gets treated as a
+		// user scroll, bumps transcript auto-scroll's lastUserScroll to now,
+		// and poisons the AUTO_SCROLL_COOLDOWN for the next ~2s — throttling
+		// transcript auto-scroll to once per cooldown instead of once per
+		// segment change.
+		this.programmaticScrollUntil = Date.now() + duration + 500;
 
 		const step = (now: number) => {
 			const elapsed = now - startTime;
 			const t = Math.min(elapsed / duration, 1);
 			const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 			window.scrollTo(0, startY + distance * ease);
-			if (t < 1) {
-				requestAnimationFrame(step);
-			} else {
-				setTimeout(() => { Reader.programmaticScroll = false; }, 50);
-			}
+			if (t < 1) requestAnimationFrame(step);
 		};
 
 		requestAnimationFrame(step);
@@ -2284,7 +2290,7 @@ export class Reader {
 			wireTranscript(doc, article, this.settings, {
 				getStickyOffset: () => this.getStickyOffset(),
 				scrollTo: (y) => this.scrollTo(y),
-				programmaticScroll: () => this.programmaticScroll,
+				programmaticScroll: () => Date.now() < this.programmaticScrollUntil,
 			}, (key, value) => {
 				(this.settings as any)[key] = value;
 				this.saveSettings();

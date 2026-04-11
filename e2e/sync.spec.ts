@@ -180,8 +180,20 @@ async function enterReaderMode(page: Page): Promise<void> {
 	});
 	if (tabId == null) throw new Error(`no active tab found`);
 
+	// Mirror what background.ts injectReaderScript() does in production:
+	// reader.css first, then browser-polyfill, then reader-script.js. Without
+	// reader.css, the transcript layout / sticky player CSS rules don't apply
+	// — tests would pass `hasPinClass` but computed position would be static.
 	await sw.evaluate(async (id) => {
 		const chromeApi = (globalThis as any).chrome;
+		await chromeApi.scripting.insertCSS({
+			target: { tabId: id },
+			files: ['reader.css'],
+		});
+		await chromeApi.scripting.executeScript({
+			target: { tabId: id },
+			files: ['browser-polyfill.min.js'],
+		});
 		await chromeApi.scripting.executeScript({
 			target: { tabId: id },
 			files: ['reader-script.js'],
@@ -779,6 +791,161 @@ test('auto-scroll: transcript segment advance scrolls the page', async ({
 
 	const finalScrollY = await page.evaluate(() => window.scrollY);
 	expect(finalScrollY).toBeGreaterThan(fixtureShape.initialScrollY);
+});
+
+test('auto-scroll: sustained across the AUTO_SCROLL_COOLDOWN window', async ({
+	page, context, articleUrl,
+}) => {
+	// Regression test for the cooldown-lockup bug: after the first auto-scroll
+	// a late scroll event could slip past the `programmaticScroll` flag,
+	// bump `lastUserScroll = Date.now()`, and poison the next 2000ms cooldown.
+	// Fix switched from a boolean flag + setTimeout to a
+	// `programmaticScrollUntil` timestamp with a generous 500ms grace window.
+	const fakeContent = makeTranscriptNoteContent();
+	await context.route('**/localhost:27124/page**', async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				notePath: 'E2E/auto-scroll-fixture.md',
+				title: 'Auto-scroll Fixture',
+				content: fakeContent,
+				noteModified: Date.now(),
+			}),
+		});
+	});
+
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+	await page.waitForFunction(() => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement | null;
+		return !!v && v.readyState >= 1 && v.duration > 120;
+	}, { timeout: 5000 });
+
+	// First advance: segment 12 at t=60.
+	await page.evaluate(async () => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement;
+		await new Promise<void>(resolve => {
+			v.addEventListener('seeked', () => resolve(), { once: true });
+			v.currentTime = 60;
+		});
+	});
+	await page.waitForFunction(
+		() => window.scrollY > 0,
+		{ timeout: 2000 }
+	);
+	const firstScrollY = await page.evaluate(() => window.scrollY);
+
+	// Wait past the AUTO_SCROLL_COOLDOWN (2000ms) so the next advance isn't
+	// suppressed by the recent auto-scroll.
+	await page.waitForTimeout(2100);
+
+	// Second advance: segment 24 at t=120. If the cooldown is poisoned by a
+	// late scroll event, this second auto-scroll will not fire and scrollY
+	// stays at firstScrollY.
+	await page.evaluate(async () => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement;
+		await new Promise<void>(resolve => {
+			v.addEventListener('seeked', () => resolve(), { once: true });
+			v.currentTime = 120;
+		});
+	});
+	await page.waitForFunction(
+		(prev) => window.scrollY > (prev as number) + 10,
+		firstScrollY,
+		{ timeout: 3000 }
+	);
+
+	const secondScrollY = await page.evaluate(() => window.scrollY);
+	expect(secondScrollY).toBeGreaterThan(firstScrollY);
+});
+
+test('pin player: no ancestor breaks sticky, and the player stays pinned during auto-scroll', async ({
+	page, context, articleUrl,
+}) => {
+	const fakeContent = makeTranscriptNoteContent();
+	await context.route('**/localhost:27124/page**', async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				notePath: 'E2E/auto-scroll-fixture.md',
+				title: 'Pin Fixture',
+				content: fakeContent,
+				noteModified: Date.now(),
+			}),
+		});
+	});
+
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+	await page.waitForSelector('.player-container');
+	await page.waitForFunction(() => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement | null;
+		return !!v && v.readyState >= 1 && v.duration > 60;
+	}, { timeout: 5000 });
+
+	// 1. Class + computed position.
+	const pinned = await page.evaluate(() => {
+		const pc = document.querySelector('.player-container') as HTMLElement | null;
+		return {
+			hasPinClass: pc?.classList.contains('pin-player') ?? false,
+			computedPosition: pc ? getComputedStyle(pc).position : null,
+			computedTop: pc ? getComputedStyle(pc).top : null,
+		};
+	});
+	expect(pinned.hasPinClass).toBe(true);
+	expect(pinned.computedPosition).toBe('sticky');
+	expect(pinned.computedTop).toBe('0px');
+
+	// 2. No ancestor between .player-container and <html> creates a scroll
+	// container. `overflow: hidden|scroll|auto` on any ancestor swallows
+	// sticky. This is the root cause of the original pinning bug — the
+	// `.obsidian-reader-content` container had `overflow: hidden` which
+	// is why the video scrolled out of view.
+	const ancestors = await page.evaluate(() => {
+		const pc = document.querySelector('.player-container') as HTMLElement;
+		const bad: Array<{ tag: string; cls: string; overflow: string }> = [];
+		let el: HTMLElement | null = pc.parentElement;
+		while (el && el !== document.documentElement) {
+			const ov = getComputedStyle(el).overflow;
+			if (/(hidden|scroll|auto)/.test(ov) && ov !== 'visible') {
+				bad.push({ tag: el.tagName, cls: el.className.slice(0, 50), overflow: ov });
+			}
+			el = el.parentElement;
+		}
+		return bad;
+	});
+	expect(ancestors).toEqual([]);
+
+	// 3. Functional check: drive auto-scroll to segment 24 (t=120) and
+	// verify the player-container's bounding rect stays at top: 0 (pinned)
+	// throughout. Using the real video seek so updateActiveSegment fires
+	// naturally.
+	await page.evaluate(async () => {
+		const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement;
+		await new Promise<void>(resolve => {
+			v.addEventListener('seeked', () => resolve(), { once: true });
+			v.currentTime = 120;
+		});
+	});
+	// Wait for the auto-scroll to finish.
+	await page.waitForFunction(
+		() => window.scrollY > 500,
+		{ timeout: 3000 }
+	);
+
+	const playerAfterScroll = await page.evaluate(() => {
+		const pc = document.querySelector('.player-container') as HTMLElement;
+		const r = pc.getBoundingClientRect();
+		return { top: r.top, bottom: r.bottom, scrollY: window.scrollY };
+	});
+	// Pinned: top is at 0 (or very close), and bottom is in the viewport.
+	expect(playerAfterScroll.top).toBeGreaterThanOrEqual(-1);
+	expect(playerAfterScroll.top).toBeLessThan(20);
+	expect(playerAfterScroll.bottom).toBeGreaterThan(0);
 });
 
 test('multi-highlight: removing one highlight leaves the others intact', async ({
