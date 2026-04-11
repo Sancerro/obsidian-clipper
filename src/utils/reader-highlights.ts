@@ -50,6 +50,177 @@ function findContentRoot(): Element {
 	return document.body;
 }
 
+function normalizeCurrentUrl(): string {
+	return window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+}
+
+// ── Highlight data cache + undo/redo history ─────────────
+//
+// The legacy XPath system in highlighter.ts has its own history stack
+// operating on the `highlights` array. That stack is now unreachable for
+// text-anchor highlights, which are the only ones any user actually
+// creates. This module owns a parallel stack + cache for the text-anchor
+// flow: every time a highlight enters the DOM (user add, SSE load,
+// reader-mode bake-in) we cache its data keyed by id; every add/remove
+// records an op; undo/redo reverses the op through the same pipeline the
+// original user action went through (DOM mutation + local storage +
+// plugin POST).
+
+const highlightCache = new Map<string, ReaderHighlightData>();
+
+export function cacheHighlight(h: ReaderHighlightData): void {
+	highlightCache.set(h.id, h);
+}
+
+export function cacheHighlights(list: ReaderHighlightData[]): void {
+	for (const h of list) highlightCache.set(h.id, h);
+}
+
+export function getCachedHighlight(id: string): ReaderHighlightData | undefined {
+	return highlightCache.get(id);
+}
+
+export function uncacheHighlight(id: string): void {
+	highlightCache.delete(id);
+}
+
+interface HighlightOp {
+	type: 'add' | 'remove';
+	url: string;
+	highlight: ReaderHighlightData;
+}
+
+const MAX_HIGHLIGHT_HISTORY = 50;
+let highlightHistory: HighlightOp[] = [];
+let highlightRedoStack: HighlightOp[] = [];
+
+// IDs the UI has removed this session. Used by loadAndApplyPageHighlights
+// to prevent the reconciliation path from re-uploading a local-only
+// highlight that was just removed — browser.storage.local writes are
+// async-enqueued, so there's a window where local storage still looks
+// like it has the highlight even after removeReaderHighlight() returns.
+const locallyRemovedIds = new Set<string>();
+
+// IDs whose /highlights/add POST is in flight right now. During that
+// window, local storage already has the highlight (via saveReaderHighlight)
+// but the plugin doesn't yet. The reconciliation path would see it as
+// local-only and double-POST it; this set tells reconciliation to skip.
+const inFlightAddIds = new Set<string>();
+
+function markLocallyRemoved(id: string): void {
+	locallyRemovedIds.add(id);
+}
+
+function unmarkLocallyRemoved(id: string): void {
+	locallyRemovedIds.delete(id);
+}
+
+/** Record an add/remove as an undoable op. Clears the redo stack. */
+export function recordHighlightOp(op: HighlightOp): void {
+	highlightHistory.push(op);
+	if (highlightHistory.length > MAX_HIGHLIGHT_HISTORY) {
+		highlightHistory.shift();
+	}
+	highlightRedoStack = [];
+}
+
+export function canUndoReaderHighlight(): boolean {
+	return highlightHistory.length > 0;
+}
+
+export function canRedoReaderHighlight(): boolean {
+	return highlightRedoStack.length > 0;
+}
+
+/** Re-apply an add: find the text anchor, wrap, save locally, POST. */
+async function replayAdd(url: string, h: ReaderHighlightData): Promise<void> {
+	// Clear any tombstone so reconciliation doesn't filter this out.
+	unmarkLocallyRemoved(h.id);
+	// Guard against the reconciliation double-POST: while this POST is
+	// in flight, local storage has the highlight but the plugin doesn't,
+	// so loadAndApplyPageHighlights would try to push it up again.
+	inFlightAddIds.add(h.id);
+	const root = findContentRoot();
+	const fullText = getCleanTextContent(root);
+	const range = findTextRange(root, fullText, h.exactText, h.prefixText, h.suffixText);
+	if (range) {
+		wrapRangeInMarks(range, 'reading-selection-highlight-mark', h.id);
+	}
+	saveReaderHighlight(url, h);
+	cacheHighlight(h);
+	try {
+		const res = await pluginFetch('/highlights/add', {
+			method: 'POST',
+			body: { url, highlight: h },
+		});
+		if (!res.ok) {
+			logHandledError('ReaderHighlightUndoAdd', res.error || 'Failed to re-add highlight', {
+				url,
+				highlightId: h.id,
+				errorType: res.errorType,
+			});
+		}
+	} catch (e) {
+		logHandledError('ReaderHighlightUndoAdd', e, { url, highlightId: h.id });
+	} finally {
+		inFlightAddIds.delete(h.id);
+	}
+}
+
+/** Replay a remove: unwrap marks, clear local, POST remove. */
+async function replayRemove(url: string, h: ReaderHighlightData): Promise<void> {
+	// Synchronously mark as removed so the async enqueue race doesn't
+	// re-reconcile this highlight back to the plugin.
+	markLocallyRemoved(h.id);
+	document
+		.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${h.id}"]`)
+		.forEach(m => m.replaceWith(...Array.from(m.childNodes)));
+	removeReaderHighlight(url, h.id);
+	uncacheHighlight(h.id);
+	try {
+		const res = await pluginFetch('/highlights/remove', {
+			method: 'POST',
+			body: { url, highlightId: h.id },
+		});
+		if (!res.ok) {
+			queueRemoteHighlightRemoval(url, h.id);
+			logHandledError('ReaderHighlightUndoRemove', res.error || 'Failed to remove highlight', {
+				url,
+				highlightId: h.id,
+				errorType: res.errorType,
+			});
+		}
+	} catch (e) {
+		logHandledError('ReaderHighlightUndoRemove', e, { url, highlightId: h.id });
+	}
+}
+
+/** Undo the most recent highlight add/remove. Returns true if it did work. */
+export async function undoReaderHighlight(): Promise<boolean> {
+	const op = highlightHistory.pop();
+	if (!op) return false;
+	highlightRedoStack.push(op);
+	if (op.type === 'add') {
+		await replayRemove(op.url, op.highlight);
+	} else {
+		await replayAdd(op.url, op.highlight);
+	}
+	return true;
+}
+
+/** Redo the most recently undone highlight op. Returns true if it did work. */
+export async function redoReaderHighlight(): Promise<boolean> {
+	const op = highlightRedoStack.pop();
+	if (!op) return false;
+	highlightHistory.push(op);
+	if (op.type === 'add') {
+		await replayAdd(op.url, op.highlight);
+	} else {
+		await replayRemove(op.url, op.highlight);
+	}
+	return true;
+}
+
 // ── Selection → Highlight ────────────────────────────────
 
 export function handleReaderModeHighlight(selection: Selection): void {
@@ -142,11 +313,18 @@ export function handleReaderModeHighlight(selection: Selection): void {
 
 	const highlightData = { id, exactText: mergedText, prefixText, suffixText };
 	saveReaderHighlight(url, highlightData);
+	cacheHighlight(highlightData);
+	recordHighlightOp({ type: 'add', url, highlight: highlightData });
 
+	// Guard against reconciliation-double-POST: local already has this
+	// highlight, plugin doesn't yet. A SSE refresh triggered by an earlier
+	// op could otherwise push it up before our POST lands.
+	inFlightAddIds.add(id);
 	pluginFetch('/highlights/add', {
 		method: 'POST',
 		body: { url, highlight: highlightData }
 	}).then(res => {
+		inFlightAddIds.delete(id);
 		if (!res.ok) {
 			logHandledError('ReaderHighlightAdd', res.error || 'Failed to sync highlight add', {
 				url,
@@ -163,6 +341,8 @@ export function handleReaderModeHighlight(selection: Selection): void {
 				logHandledError('AutoClip', err, { url });
 			});
 		}
+	}, () => {
+		inFlightAddIds.delete(id);
 	});
 }
 
@@ -785,14 +965,30 @@ export async function loadAndApplyPageHighlights(): Promise<void> {
 
 	const localHighlights = await loadReaderHighlights(url);
 	const seenIds = new Set(pluginHighlights.map(h => h.id));
-	const highlights = [...pluginHighlights];
+	const highlights: ReaderHighlightData[] = [];
+	// Filter out anything the plugin is serving back that we've locally
+	// removed — it means our /highlights/remove POST hasn't landed yet.
+	// Re-applying it would fight the in-flight remove.
+	for (const h of pluginHighlights) {
+		if (!locallyRemovedIds.has(h.id)) highlights.push(h);
+	}
 	const localOnlyHighlights: ReaderHighlightData[] = [];
 	for (const lh of localHighlights) {
-		if (!seenIds.has(lh.id)) {
-			highlights.push(lh);
-			localOnlyHighlights.push(lh);
-		}
+		if (seenIds.has(lh.id)) continue;
+		// Same filter for the local-only → reconcile path: if we just
+		// removed this, don't push it back up to the plugin.
+		if (locallyRemovedIds.has(lh.id)) continue;
+		// And if we're in the middle of ADD-ing this (POST in flight),
+		// local already has it but plugin doesn't yet — the in-flight
+		// POST will finish the reconciliation itself, don't double-post.
+		if (inFlightAddIds.has(lh.id)) continue;
+		highlights.push(lh);
+		localOnlyHighlights.push(lh);
 	}
+	// Keep the in-memory highlight cache in sync with what's currently
+	// known for this URL so the undo system can look up the full text-
+	// anchor data when the user removes a highlight.
+	cacheHighlights(highlights);
 
 	// Reconcile: if plugin is online, push any local-only highlights to the plugin
 	// (covers the case where plugin was offline when highlights were created).
@@ -908,12 +1104,21 @@ export function wirePageMarkClickHandlers(): void {
 		canRemove: () => document.body.classList.contains('obsidian-highlighter-active'),
 		useCapture: true,
 		onRemove: (highlightId) => {
+		// Record the op for undo BEFORE unwrapping, while we can still look
+		// up the full text-anchor data from the cache.
+		const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+		const cached = highlightCache.get(highlightId);
+		if (cached) {
+			recordHighlightOp({ type: 'remove', url, highlight: cached });
+		}
+		markLocallyRemoved(highlightId);
+
 		// Remove all spans with this highlight ID
 		document.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${highlightId}"]`).forEach(m => {
 			m.replaceWith(...Array.from(m.childNodes));
 		});
+		uncacheHighlight(highlightId);
 
-		const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
 		removeReaderHighlight(url, highlightId);
 
 		// Notify plugin

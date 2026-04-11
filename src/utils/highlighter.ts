@@ -16,7 +16,7 @@ import {
 } from './highlighter-overlays';
 import { detectBrowser, addBrowserClassToHtml } from './browser-detection';
 import { generalSettings, loadSettings } from './storage-utils';
-import { handleReaderModeHighlight, loadAndApplyPageHighlights, wirePageMarkClickHandlers, clearReaderHighlights, startPageHighlightSync } from './reader-highlights';
+import { handleReaderModeHighlight, loadAndApplyPageHighlights, wirePageMarkClickHandlers, clearReaderHighlights, startPageHighlightSync, undoReaderHighlight, redoReaderHighlight, canUndoReaderHighlight, canRedoReaderHighlight } from './reader-highlights';
 import { getPluginErrorMessage, pluginFetch } from './plugin-url';
 import { logHandledError } from './error-utils';
 
@@ -822,10 +822,22 @@ function handleKeyDown(event: KeyboardEvent) {
 		exitHighlighterMode();
 	} else if ((event.metaKey || event.ctrlKey) && event.key === 'z') {
 		event.preventDefault();
+		// Prefer the text-anchor undo/redo (reader-highlights.ts) since that's
+		// the system every real highlight uses now. Fall back to the legacy
+		// XPath undo/redo (in this file) only when the text-anchor stack is
+		// empty, so legacy highlights still get their undo behavior.
 		if (event.shiftKey) {
-			redo();
+			if (canRedoReaderHighlight()) {
+				redoReaderHighlight().catch(err => console.error('redo failed', err));
+			} else {
+				redo();
+			}
 		} else {
-			undo();
+			if (canUndoReaderHighlight()) {
+				undoReaderHighlight().catch(err => console.error('undo failed', err));
+			} else {
+				undo();
+			}
 		}
 	}
 }

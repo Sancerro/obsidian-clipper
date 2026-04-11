@@ -6,7 +6,7 @@ import { getLocalStorage, setLocalStorage } from './storage-utils';
 import hljs from 'highlight.js';
 import { getDomain } from './string-utils';
 import { toggleHighlighterMenu } from './highlighter';
-import { attachMarkClickHandler, clearReaderHighlights, findTextRange, flushPendingRemoteHighlightRemovals, loadReaderHighlights, queueRemoteHighlightRemoval, removeReaderHighlight, wrapRangeInMarks, loadAndApplyPageHighlights, wirePageMarkClickHandlers, getCleanTextContent, startPageHighlightSync, stopPageHighlightSync, subscribeHighlightChanges, type HighlightSync, type ReaderHighlightData } from './reader-highlights';
+import { attachMarkClickHandler, cacheHighlight, cacheHighlights, clearReaderHighlights, findTextRange, flushPendingRemoteHighlightRemovals, getCachedHighlight, loadReaderHighlights, queueRemoteHighlightRemoval, recordHighlightOp, removeReaderHighlight, uncacheHighlight, wrapRangeInMarks, loadAndApplyPageHighlights, wirePageMarkClickHandlers, getCleanTextContent, startPageHighlightSync, stopPageHighlightSync, subscribeHighlightChanges, type HighlightSync, type ReaderHighlightData } from './reader-highlights';
 import { getPluginErrorMessage, pluginFetch } from './plugin-url';
 import { copyToClipboard } from './clipboard-utils';
 import { getMessage, initializeI18n } from './i18n';
@@ -2614,12 +2614,20 @@ export class Reader {
 				if (!this.currentNoteUrl) return;
 				const currentUrl = this.currentNoteUrl;
 
+				// Record for undo BEFORE mutating DOM or clearing the cache
+				// entry, so the cached text-anchor data is still available.
+				const cached = getCachedHighlight(highlightId);
+				if (cached) {
+					recordHighlightOp({ type: 'remove', url: currentUrl, highlight: cached });
+				}
+
 				// Optimistic: remove ALL marks with this highlight ID
 				article.querySelectorAll(
 					`.reading-selection-highlight-mark[data-highlight-id="${highlightId}"]`
 				).forEach(m => {
 					m.replaceWith(...Array.from(m.childNodes));
 				});
+				uncacheHighlight(highlightId);
 
 				// Remove from local storage
 				removeReaderHighlight(this.currentNoteUrl, highlightId);
@@ -2690,6 +2698,9 @@ export class Reader {
 			const data = res.data as { entry?: { highlights?: ReaderHighlightData[] } };
 			const remoteHighlights = data.entry?.highlights ?? [];
 			const remoteIds = new Set(remoteHighlights.map(h => h.id));
+			// Keep the undo cache in sync with what the plugin currently
+			// thinks is on this URL.
+			cacheHighlights(remoteHighlights);
 
 			for (const [pendingId, op] of this.pendingOptimisticOps) {
 				if (op === 'add' && remoteIds.has(pendingId)) {

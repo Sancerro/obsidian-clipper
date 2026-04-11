@@ -1040,12 +1040,70 @@ test('exit reader mode: restores the original page DOM and removes reader chrome
 	expect(afterReader.hasP2).toBe(true);
 });
 
-// Undo / redo (Cmd+Z / Cmd+Shift+Z) intentionally NOT tested:
-// `highlighter.ts#handleKeyDown` binds these to `undo()` / `redo()` in the
-// LEGACY XPath highlight system. The text-anchor mark flow used by everything
-// real (reader-highlights.ts) has no history stack, so Cmd+Z is a silent
-// no-op for any highlight created in the current architecture. Writing a
-// test against behavior that doesn't exist would just codify the gap.
+test('undo / redo: Cmd+Z undoes a highlight add, Cmd+Shift+Z redoes it', async ({
+	page, articleUrl, realPlugin,
+}) => {
+	await page.goto(articleUrl);
+	await enterHighlighterMode(page);
+
+	// Create two highlights.
+	await dragSelect(page, '#p1', 'quick brown fox');
+	await releaseDrag(page);
+	await pollForHighlightText(realPlugin, articleUrl, 'quick brown fox');
+
+	await dragSelect(page, '#p2', 'boxing wizards');
+	await releaseDrag(page);
+	await pollForHighlightText(realPlugin, articleUrl, 'boxing wizards');
+
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(2);
+
+	// Cmd+Z should undo the most recent add ("boxing wizards"), which
+	// unwraps the marks, removes from local storage, and POSTs
+	// /highlights/remove to the plugin.
+	await page.keyboard.press('Meta+z');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).map(h => h.exactText),
+		POLL_OPTS
+	).toEqual(
+		expect.arrayContaining([expect.stringContaining('quick brown fox')])
+	);
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(1);
+	// The remaining highlight is the first one, not "boxing wizards".
+	const remainingAfterUndo = await realPlugin.getHighlights(articleUrl);
+	expect(remainingAfterUndo.some(h => h.exactText.includes('boxing wizards'))).toBe(false);
+	expect(remainingAfterUndo.some(h => h.exactText.includes('quick brown fox'))).toBe(true);
+
+	// Undo again — now both highlights gone.
+	await page.keyboard.press('Meta+z');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(0);
+
+	// Cmd+Shift+Z redo should put "quick brown fox" back.
+	await page.keyboard.press('Meta+Shift+z');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(1);
+
+	// Redo again puts "boxing wizards" back.
+	await page.keyboard.press('Meta+Shift+z');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(2);
+
+	const both = await realPlugin.getHighlights(articleUrl);
+	expect(both.some(h => h.exactText.includes('quick brown fox'))).toBe(true);
+	expect(both.some(h => h.exactText.includes('boxing wizards'))).toBe(true);
+});
 
 test('multi-highlight: removing one highlight leaves the others intact', async ({
 	page, articleUrl, realPlugin,
