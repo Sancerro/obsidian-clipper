@@ -3,52 +3,72 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { test as base, chromium } from '@playwright/test';
 import type { BrowserContext } from '@playwright/test';
-import { FakePlugin } from './fake-plugin';
 import { FixtureServer } from './fixture-server';
+import { RealPluginClient, TEST_ARTICLE_URL } from './real-plugin';
 
 /**
- * Test fixture for Chromium-based e2e tests.
+ * Test fixture for the clipper e2e suite. No mocks — every test talks to the
+ * real reading-selection-highlight plugin running in Obsidian on :27124.
+ *
+ * Preconditions:
+ *   - Obsidian is running with the reading-selection-highlight plugin enabled.
+ *   - The plugin's HTTP server is listening on 127.0.0.1:27124.
+ * The preflight check below fails fast with a clear message otherwise.
  *
  * Provides:
- *   - `context` — a persistent Chromium context with the dev/ extension loaded
- *     via native --load-extension. All requests to localhost:27124 are
- *     intercepted by context.route() and redirected to FAKE_PLUGIN_PORT, so
- *     the real Obsidian reading-selection-highlight plugin can remain running
- *     on 27124 without conflict. (This works on Chromium because
- *     context.route DOES intercept extension background/service-worker fetches
- *     — unlike Playwright's Firefox build.)
- *   - `page` — first page of the context
- *   - `fakePlugin` — a FakePlugin listening on 127.0.0.1:FAKE_PLUGIN_PORT
- *   - `fixtureServer` — a static server on :3100 serving e2e/fixtures/
- *   - `articleUrl` — the URL of the article fixture
+ *   - `context` — persistent Chromium context with the dev/ extension loaded
+ *   - `page` — first page
+ *   - `realPlugin` — a RealPluginClient for setup/assertions/teardown
+ *   - `fixtureServer` — static HTTP server on :3100 (content_scripts need http)
+ *   - `articleUrl` — the URL the test note is linked to (= TEST_ARTICLE_URL)
  *
- * Tests run headless using `channel: 'chromium'`, which uses the full
- * Chromium binary in new-headless mode — the headless shell does NOT
- * support `--load-extension`, but new-headless does. No window is shown,
- * no workspace is stolen, ~9s per full run.
+ * Each test runs with a clean highlight state for the test URL — cleared
+ * both before `use` and after teardown. The test note in E2E/ is created
+ * once and left in the vault.
  *
- * Only one worker at a time (playwright.config.ts enforces this).
+ * Runs headless via `channel: 'chromium'` + `headless: true` (the full
+ * Chromium binary in new-headless mode supports --load-extension). One
+ * worker — the plugin is global shared state.
  */
-
-const FAKE_PLUGIN_PORT = 27125;
 
 type Fixtures = {
 	context: BrowserContext;
-	fakePlugin: FakePlugin;
+	realPlugin: RealPluginClient;
 	fixtureServer: FixtureServer;
 	articleUrl: string;
 };
 
+// One-time preflight shared across the suite.
+let preflighted = false;
+async function preflight(plugin: RealPluginClient): Promise<void> {
+	if (preflighted) return;
+	preflighted = true;
+	const ok = await plugin.health();
+	if (!ok) {
+		throw new Error(
+			'\n\nReal reading-selection-highlight plugin is not reachable on localhost:27124.\n' +
+			'These tests talk to the real plugin — no mocks. To run them:\n' +
+			'  1. Open Obsidian with the reading-selection-highlight plugin enabled.\n' +
+			'  2. Verify `curl http://localhost:27124/health` returns 200.\n' +
+			'  3. Rerun the tests.\n'
+		);
+	}
+	await plugin.ensureTestNote();
+}
+
 export const test = base.extend<Fixtures>({
-	fakePlugin: async ({}, use) => {
-		const plugin = new FakePlugin();
-		await plugin.start(FAKE_PLUGIN_PORT);
+	realPlugin: async ({}, use) => {
+		const plugin = new RealPluginClient();
+		await preflight(plugin);
+		// Clean slate for the test URL
+		await plugin.clearHighlightsForUrl(TEST_ARTICLE_URL);
 		await use(plugin);
-		await plugin.stop();
+		// Tear down: remove every highlight this test added
+		await plugin.clearHighlightsForUrl(TEST_ARTICLE_URL);
 	},
 
-	context: async ({ fakePlugin }, use) => {
-		void fakePlugin; // dependency: fake is up before extension wakes
+	context: async ({ realPlugin }, use) => {
+		void realPlugin; // ensures plugin preflight ran before the browser starts
 		const extPath = path.resolve(__dirname, '..', 'dev');
 		const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clipper-e2e-'));
 		const ctx = await chromium.launchPersistentContext(profileDir, {
@@ -59,20 +79,6 @@ export const test = base.extend<Fixtures>({
 				`--load-extension=${extPath}`,
 			],
 		});
-
-		// Redirect all :27124 traffic to the fake plugin on :FAKE_PLUGIN_PORT.
-		// Works for both fetch() and EventSource since route.continue streams
-		// the upstream response through unchanged.
-		await ctx.route('**/*', async (route) => {
-			const url = route.request().url();
-			if (url.startsWith('http://localhost:27124') || url.startsWith('http://127.0.0.1:27124')) {
-				const rewritten = url.replace(/:27124/, `:${FAKE_PLUGIN_PORT}`);
-				await route.continue({ url: rewritten });
-			} else {
-				await route.continue();
-			}
-		});
-
 		await use(ctx);
 		await ctx.close();
 	},
@@ -85,7 +91,8 @@ export const test = base.extend<Fixtures>({
 	},
 
 	articleUrl: async ({ fixtureServer }, use) => {
-		await use(fixtureServer.urlFor('/article.html'));
+		void fixtureServer; // ensure the static server is up
+		await use(TEST_ARTICLE_URL);
 	},
 });
 

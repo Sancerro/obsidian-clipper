@@ -61,6 +61,10 @@ export class FixtureServer {
 
 	async stop(): Promise<void> {
 		if (this.server) {
+			// Chrome holds HTTP/1.1 keep-alive connections open; plain close()
+			// waits for them to drain (hangs until the browser closes the tab).
+			// Force-drop them so teardown returns promptly.
+			this.server.closeAllConnections?.();
 			await new Promise<void>(resolve => this.server!.close(() => resolve()));
 			this.server = null;
 		}
