@@ -666,6 +666,128 @@ test('offline: highlight created while plugin is unreachable gets pushed on relo
 		.toContain('boxing wizards');
 });
 
+// ── Transcript auto-scroll ───────────────────────────────
+
+/**
+ * Build a reader-mode article body containing a native YouTube <video>
+ * element and a `.youtube.transcript` block with many timed segments.
+ * This is exactly the shape Reader.apply → wireTranscript expects.
+ */
+function makeTranscriptNoteContent(): string {
+	const segments: string[] = [];
+	for (let i = 0; i < 30; i++) {
+		const time = i * 5; // segments every 5 seconds
+		const mm = Math.floor(time / 60);
+		const ss = (time % 60).toString().padStart(2, '0');
+		// Padding text so the whole transcript exceeds the viewport and
+		// scrolling is actually necessary to keep the active segment visible.
+		const pad = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. ' +
+			'Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.';
+		segments.push(
+			`<div class="transcript-segment">` +
+				`<strong><span class="timestamp" data-timestamp="${time}">${mm}:${ss}</span></strong>` +
+				` · Segment ${i} — ${pad}` +
+			`</div>`
+		);
+	}
+	return (
+		'<article>' +
+			'<h1>Transcript Fixture</h1>' +
+			'<div class="reader-video-wrapper">' +
+				'<video class="reader-video-player" muted playsinline preload="none"></video>' +
+			'</div>' +
+			'<section class="youtube transcript">' +
+				segments.join('') +
+			'</section>' +
+		'</article>'
+	);
+}
+
+test('auto-scroll: transcript segment advance scrolls the page', async ({
+	page, context, articleUrl,
+}) => {
+	// Mock the plugin's /page endpoint so reader mode renders our
+	// hand-crafted transcript content. All other plugin endpoints still go
+	// to the real plugin.
+	const fakeContent = makeTranscriptNoteContent();
+	await context.route('**/localhost:27124/page**', async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				ok: true,
+				notePath: 'E2E/auto-scroll-fixture.md',
+				title: 'Auto-scroll Fixture',
+				content: fakeContent,
+				noteModified: Date.now(),
+			}),
+		});
+	});
+
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+	await page.waitForSelector('.youtube.transcript .transcript-segment');
+
+	const fixtureShape = await page.evaluate(() => ({
+		readerActive: document.documentElement.classList.contains('obsidian-reader-active'),
+		segmentCount: document.querySelectorAll('.transcript-segment').length,
+		hasVideo: !!document.querySelector('.reader-video-wrapper video.reader-video-player'),
+		hasPlayerContainer: !!document.querySelector('.player-container'),
+		firstSegmentRestructured: !!document.querySelector('.transcript-segment .transcript-segment-text'),
+		initialScrollY: window.scrollY,
+	}));
+	expect(fixtureShape.readerActive).toBe(true);
+	expect(fixtureShape.segmentCount).toBe(30);
+	expect(fixtureShape.hasVideo).toBe(true);
+	expect(fixtureShape.hasPlayerContainer).toBe(true);
+	expect(fixtureShape.firstSegmentRestructured).toBe(true);
+
+	// Drive the advance from INSIDE the extension's content-script isolated
+	// world. reader-script.js (wireTranscript, timeupdate listener) runs
+	// there via chrome.scripting.executeScript, and the main-world page has
+	// its own separate HTMLMediaElement.prototype — overriding currentTime
+	// from page.evaluate only affects the main world, so wireTranscript
+	// keeps reading the native 0 and never advances. Running the override
+	// and dispatch through the service worker (which defaults executeScript
+	// to the ISOLATED world) puts them in the same realm as the listener.
+	const sw = await getServiceWorker(context.browser()!.contexts()[0] ?? context);
+	const tabId = await sw.evaluate(async () => {
+		const tabs = await (globalThis as any).chrome.tabs.query({ active: true, currentWindow: true });
+		return tabs[0]?.id ?? null;
+	});
+	await sw.evaluate(async (id) => {
+		await (globalThis as any).chrome.scripting.executeScript({
+			target: { tabId: id },
+			func: () => {
+				Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+					get: function () { return 60; },
+					set: function (_v: number) {},
+					configurable: true,
+				});
+				const v = document.querySelector('.reader-video-wrapper video.reader-video-player') as HTMLVideoElement;
+				v.dispatchEvent(new Event('timeupdate'));
+			},
+		});
+	}, tabId);
+
+	// Wait for segment 12 (t=60) to become active.
+	await page.waitForFunction(() => {
+		const active = document.querySelector('.transcript-segment.is-active .timestamp');
+		return active?.getAttribute('data-timestamp') === '60';
+	}, { timeout: 3000 });
+
+	// Auto-scroll animates via requestAnimationFrame (~200ms) then a 50ms
+	// tail before the programmatic-scroll flag resets. Poll until scrollY
+	// actually moves.
+	await page.waitForFunction(
+		() => window.scrollY > 0,
+		{ timeout: 2000 }
+	);
+
+	const finalScrollY = await page.evaluate(() => window.scrollY);
+	expect(finalScrollY).toBeGreaterThan(fixtureShape.initialScrollY);
+});
+
 test('multi-highlight: removing one highlight leaves the others intact', async ({
 	page, articleUrl, realPlugin,
 }) => {
