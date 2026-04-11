@@ -1890,13 +1890,19 @@ export class Reader {
 			// Capture YouTube video state before cleanup destroys the player
 			let videoTimestamp = 0;
 			let videoWasPlaying = false;
+			let youtubeVideoElement: HTMLVideoElement | null = null;
 			const host = doc.URL ? new URL(doc.URL).hostname : '';
 			const isYouTube = host.includes('youtube.com') || host.includes('youtu.be');
+			const browserType = isYouTube ? await detectBrowser() : '';
 			if (isYouTube) {
 				const videoElement = doc.querySelector('video');
 				if (videoElement) {
 					videoTimestamp = Math.floor(videoElement.currentTime);
 					videoWasPlaying = !videoElement.paused;
+					if (browserType !== 'chrome') {
+						youtubeVideoElement = videoElement;
+						videoElement.remove();
+					}
 				}
 			}
 
@@ -2157,13 +2163,41 @@ export class Reader {
 			const contentDoc = parser.parseFromString(content, 'text/html');
 			const contentBody = contentDoc.body;
 
-			// On YouTube, fix embed self-referrer blocking and resume playback state
+			// On YouTube, replace the Defuddle-generated iframe with the preserved native video element,
+			// or fall back to embed handling.
 			if (isYouTube) {
 				const iframe = contentBody.querySelector('iframe[src*="youtube.com/embed/"]') as HTMLIFrameElement;
-				if (iframe) {
+				if (iframe && youtubeVideoElement) {
+					youtubeVideoElement.className = 'reader-video-player';
+					youtubeVideoElement.removeAttribute('style');
+					youtubeVideoElement.setAttribute('controls', '');
+					const videoObs = new MutationObserver(() => {
+						if (!youtubeVideoElement!.hasAttribute('controls')) {
+							youtubeVideoElement!.setAttribute('controls', '');
+						}
+						if (youtubeVideoElement!.className !== 'reader-video-player') {
+							youtubeVideoElement!.className = 'reader-video-player';
+						}
+					});
+					videoObs.observe(youtubeVideoElement, {
+						attributes: true,
+						attributeFilter: ['controls', 'class', 'style']
+					});
+					const videoWrapper = doc.createElement('div');
+					videoWrapper.className = 'reader-video-wrapper';
+					videoWrapper.appendChild(youtubeVideoElement);
+					iframe.replaceWith(videoWrapper);
+					// Restore playback state after the reattach — detaching a <video>
+					// pauses it and may reset currentTime on some browsers.
+					if (videoTimestamp > 0) {
+						try { youtubeVideoElement.currentTime = videoTimestamp; } catch {}
+					}
+					if (videoWasPlaying) {
+						youtubeVideoElement.play().catch(() => {});
+					}
+				} else if (iframe) {
 					const embedUrl = new URL(iframe.src);
 					const videoId = embedUrl.pathname.split('/').pop();
-					const browserType = await detectBrowser();
 					const isSafari = ['safari', 'mobile-safari', 'ipad-os'].includes(browserType);
 
 					if (isSafari && videoId) {

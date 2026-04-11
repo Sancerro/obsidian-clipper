@@ -243,16 +243,32 @@
 			text-decoration: underline;
 		}
 	}
+	.reader-video-wrapper {
+		aspect-ratio: 16 / 9;
+		background: #000;
+		border-radius: var(--radius-m);
+		corner-shape: var(--corner-shape);
+		overflow: hidden;
+		video.reader-video-player {
+			width: 100% !important;
+			height: 100% !important;
+			left: auto !important;
+			top: auto !important;
+			position: relative !important;
+		}
+	}
 	img, video, figure {
 		max-width: 100%;
 		height: auto;
 		border-radius: var(--radius-s);
+		corner-shape: var(--corner-shape);
 		vertical-align: bottom;
 	}
 	iframe {
 		max-width: 100%;
 		width: 100%;
-		border-radius: var(--radius-s);
+		border-radius: var(--radius-m);
+		corner-shape: var(--corner-shape);
 		overflow: hidden;
 		border: none;
 		&[src*="youtube.com"] {
