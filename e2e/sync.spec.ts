@@ -8,6 +8,49 @@ import type { Highlight } from './real-plugin';
 const LATENCY_BUDGET_MS = 1500;
 const POLL_OPTS = { intervals: [10, 10, 20, 30, 50, 100], timeout: 3000 };
 
+// Context, fixtureServer, realPlugin are all worker-scoped for speed — so
+// per-test isolation has to come from explicit hooks:
+//   - clear highlight state for the test URL on the plugin
+//   - clear the extension's own browser.storage.local so test A's
+//     local highlights don't get reconciled onto the plugin when
+//     test B loads a page (would look like leaked state)
+//   - drop any routes a test installed (offline test uses context.route)
+//   - close every extra page (multi-tab tests use context.newPage)
+
+async function clearExtensionStorage(context: BrowserContext): Promise<void> {
+	const [sw] = context.serviceWorkers();
+	if (!sw) return;
+	await sw.evaluate(async () => {
+		const api = (globalThis as any).chrome;
+		// Clearing only the highlight-related keys keeps user settings alive;
+		// that's irrelevant here since it's a fresh profile per worker, but
+		// it's also cheap and future-proof.
+		await api.storage.local.remove([
+			'readerHighlights',
+			'highlights',
+			'readerPendingRemoteRemovals',
+		]);
+	});
+}
+
+test.beforeEach(async ({ realPlugin, articleUrl, context }) => {
+	await realPlugin.clearHighlightsForUrl(articleUrl);
+	await clearExtensionStorage(context);
+	await context.unrouteAll();
+});
+
+test.afterEach(async ({ realPlugin, articleUrl, context }) => {
+	await realPlugin.clearHighlightsForUrl(articleUrl);
+	await clearExtensionStorage(context);
+	await context.unrouteAll();
+	// Close all pages that tests opened, keeping at least one alive so
+	// Playwright's default `page` fixture can still be torn down cleanly.
+	const pages = context.pages();
+	for (let i = 1; i < pages.length; i++) {
+		await pages[i].close().catch(() => {});
+	}
+});
+
 /**
  * All six ordered pairs of highlight propagation between
  * Web page (W), Reader mode (R), and Obsidian (O — the real
@@ -286,7 +329,6 @@ test('O → W: plugin-side highlight appears in page view via SSE', async ({
 }) => {
 	await page.goto(articleUrl);
 	// Let the clipper's initial load + SSE subscription settle.
-	await page.waitForTimeout(300);
 
 	const t0 = Date.now();
 	await realPlugin.addHighlight(articleUrl, {
@@ -305,7 +347,6 @@ test('O → R: plugin-side highlight appears in reader mode via SSE', async ({
 }) => {
 	await page.goto(articleUrl);
 	await enterReaderMode(page);
-	await page.waitForTimeout(300);
 
 	const t0 = Date.now();
 	await realPlugin.addHighlight(articleUrl, {
@@ -497,7 +538,6 @@ test('O → W (remove): plugin-side removal disappears in page view via SSE', as
 
 	await page.goto(articleUrl);
 	await waitForMarkWithText(page, 'vexingly quick daft zebras');
-	await page.waitForTimeout(200);
 
 	const t0 = Date.now();
 	await realPlugin.removeHighlight(articleUrl, id);
@@ -517,7 +557,6 @@ test('O → R (remove): plugin-side removal disappears in reader mode via SSE', 
 	await page.goto(articleUrl);
 	await enterReaderMode(page);
 	await waitForMarkWithText(page, 'five boxing wizards');
-	await page.waitForTimeout(200);
 
 	const t0 = Date.now();
 	await realPlugin.removeHighlight(articleUrl, id);
