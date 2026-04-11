@@ -38,8 +38,11 @@ export class FixtureServer {
 					'.html': 'text/html; charset=utf-8',
 					'.css': 'text/css; charset=utf-8',
 					'.js': 'application/javascript; charset=utf-8',
+					'.mp4': 'video/mp4',
+					'.webm': 'video/webm',
 				};
 				res.setHeader('Content-Type', mime[ext] ?? 'application/octet-stream');
+				res.setHeader('Accept-Ranges', 'bytes');
 				res.statusCode = 200;
 				res.end(body);
 			} catch {
