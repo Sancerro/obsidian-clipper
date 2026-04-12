@@ -1252,3 +1252,316 @@ test('Wikipedia IPA phonetics survive reader-mode extraction', async ({
 	});
 	expect(noEmptyParens, 'parentheses after "Apocrypha" must not be empty').toBe(true);
 });
+
+// ── SSE reconnection ────────────────────────────────────────
+//
+// The clipper subscribes to the plugin's SSE stream for real-time
+// highlight push. If the stream drops (plugin restart, network blip),
+// the clipper should reconnect and resume receiving updates.
+
+test('SSE reconnection: highlight pushed after stream drop is received', async ({
+	page, articleUrl, realPlugin, context,
+}) => {
+	await page.goto(articleUrl);
+
+	// Wait for the initial SSE connection to establish (content script
+	// calls startPageHighlightSync on load).
+	await page.waitForTimeout(500);
+
+	// Simulate an SSE stream drop by blocking all traffic to :27124 for
+	// 2 seconds, then unblocking. The clipper's reconnection logic should
+	// re-establish the stream automatically.
+	const block = async (route: import('@playwright/test').Route) => {
+		await route.fulfill({ status: 503, body: 'offline' });
+	};
+	await context.route('**/localhost:27124/highlights/stream**', block);
+	await context.route('**/127.0.0.1:27124/highlights/stream**', block);
+
+	// Wait long enough for the existing SSE connection to notice the drop.
+	await page.waitForTimeout(2000);
+
+	// Unblock — the clipper should reconnect.
+	await context.unroute('**/localhost:27124/highlights/stream**', block);
+	await context.unroute('**/127.0.0.1:27124/highlights/stream**', block);
+
+	// Give the reconnection a moment to establish.
+	await page.waitForTimeout(1000);
+
+	// Now push a highlight from the plugin side — it should arrive via
+	// the re-established SSE stream (or polling fallback).
+	await realPlugin.addHighlight(articleUrl, {
+		id: 'sse-reconnect-' + Date.now(),
+		exactText: 'quick brown fox',
+		prefixText: 'The ',
+		suffixText: ' jumps',
+	});
+
+	await waitForMarkWithText(page, 'quick brown fox');
+});
+
+// ── Orphaned highlight toast ────────────────────────────────
+//
+// When a highlight's exactText no longer exists in the page DOM (the
+// page content changed since the highlight was created), the clipper
+// shows a toast with a "Remove" button.
+
+test('orphaned highlight: toast appears when highlight text is missing from page', async ({
+	page, articleUrl, realPlugin,
+}) => {
+	// Plant a highlight with text that does NOT exist in the fixture.
+	await realPlugin.addHighlight(articleUrl, {
+		id: 'orphan-' + Date.now(),
+		exactText: 'this text does not exist anywhere in the fixture',
+		prefixText: '',
+		suffixText: '',
+	});
+
+	await page.goto(articleUrl);
+
+	// The orphan toast appears after a 3-second retry delay
+	// (loadAndApplyPageHighlights → applyHighlightMarks fails → setTimeout 3s
+	// → showOrphanedHighlightsToast). Wait for it.
+	await page.waitForSelector('#obsidian-orphaned-toast', { timeout: 8000 });
+
+	const toastText = await page.evaluate(() => {
+		const toast = document.getElementById('obsidian-orphaned-toast');
+		return toast?.textContent || '';
+	});
+	expect(toastText).toContain('no longer found');
+
+	// The toast should have a "Remove" button that cleans up the orphan.
+	const hasRemoveBtn = await page.evaluate(() => {
+		const toast = document.getElementById('obsidian-orphaned-toast');
+		const btns = toast?.querySelectorAll('button') || [];
+		return Array.from(btns).some(b => b.textContent === 'Remove');
+	});
+	expect(hasRemoveBtn).toBe(true);
+
+	// Click "Remove" — should clear the orphan from the plugin.
+	await page.evaluate(() => {
+		const toast = document.getElementById('obsidian-orphaned-toast');
+		const btn = Array.from(toast?.querySelectorAll('button') || [])
+			.find(b => b.textContent === 'Remove') as HTMLButtonElement;
+		btn?.click();
+	});
+
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(0);
+});
+
+// ── x key clears all highlights in reader mode ──────────────
+
+test('x key clears all highlights in reader mode', async ({
+	page, articleUrl, realPlugin,
+}) => {
+	// Plant two highlights.
+	await realPlugin.addHighlight(articleUrl, {
+		id: 'x-clear-a-' + Date.now(),
+		exactText: 'quick brown fox',
+		prefixText: 'The ',
+		suffixText: ' jumps',
+	});
+	await realPlugin.addHighlight(articleUrl, {
+		id: 'x-clear-b-' + Date.now(),
+		exactText: 'boxing wizards',
+		prefixText: 'five ',
+		suffixText: ' jump',
+	});
+
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+	await waitForMarkWithText(page, 'quick brown fox');
+	await waitForMarkWithText(page, 'boxing wizards');
+
+	// Press x — should clear all highlights.
+	await page.focus('body');
+	await page.keyboard.press('x');
+
+	// All marks should disappear from the DOM.
+	await waitForMarkGone(page, 'quick brown fox');
+	await waitForMarkGone(page, 'boxing wizards');
+
+	// Plugin should also have 0 highlights after sync.
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		{ intervals: [50, 100, 200, 500], timeout: 5000 }
+	).toBe(0);
+});
+
+// ── c key toggles citations in reader mode ──────────────────
+
+test('c key toggles citation visibility in reader mode', async ({
+	page, articleUrl,
+}) => {
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+
+	// Initially, show-citations class should NOT be on body.
+	const before = await page.evaluate(() =>
+		document.body.classList.contains('show-citations')
+	);
+	expect(before).toBe(false);
+
+	// Press c — should add class.
+	await page.focus('body');
+	await page.keyboard.press('c');
+
+	const after = await page.evaluate(() =>
+		document.body.classList.contains('show-citations')
+	);
+	expect(after).toBe(true);
+
+	// Press c again — should remove class.
+	await page.keyboard.press('c');
+
+	const toggled = await page.evaluate(() =>
+		document.body.classList.contains('show-citations')
+	);
+	expect(toggled).toBe(false);
+});
+
+// ── Undo/redo for remove operations ─────────────────────────
+//
+// The existing undo/redo test covers add→undo→redo. This covers
+// the symmetric case: remove→undo (mark comes back)→redo (gone again).
+
+test('undo / redo: Cmd+Z undoes a highlight remove, Cmd+Shift+Z redoes it', async ({
+	page, articleUrl, realPlugin,
+}) => {
+	// Create a highlight via the plugin so it's in a known state.
+	const id = 'undo-rm-' + Date.now();
+	await realPlugin.addHighlight(articleUrl, {
+		id,
+		exactText: 'quick brown fox',
+		prefixText: 'The ',
+		suffixText: ' jumps',
+	});
+
+	await page.goto(articleUrl);
+	await enterHighlighterMode(page);
+	await waitForMarkWithText(page, 'quick brown fox');
+
+	// Remove the highlight by clicking the mark.
+	await clickMarkById(page, id);
+	await waitForMarkGone(page, 'quick brown fox');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(0);
+
+	// Cmd+Z should undo the remove — mark comes back.
+	await page.keyboard.press('Meta+z');
+	await waitForMarkWithText(page, 'quick brown fox');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(1);
+
+	// Cmd+Shift+Z should redo the remove — mark goes away again.
+	await page.keyboard.press('Meta+Shift+z');
+	await waitForMarkGone(page, 'quick brown fox');
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		POLL_OPTS
+	).toBe(0);
+});
+
+// ── Two-tab simultaneous highlighting ───────────────────────
+
+test('two tabs: simultaneous highlights from both tabs land without overwriting', async ({
+	context, articleUrl, realPlugin,
+}) => {
+	const tab1 = await context.newPage();
+	const tab2 = await context.newPage();
+	await tab1.goto(articleUrl);
+	await tab2.goto(articleUrl);
+	await enterHighlighterMode(tab1);
+	await enterHighlighterMode(tab2);
+
+	// Highlight different text in each tab concurrently.
+	await Promise.all([
+		(async () => {
+			await dragSelect(tab1, '#p1', 'quick brown fox');
+			await releaseDrag(tab1);
+		})(),
+		(async () => {
+			await dragSelect(tab2, '#p2', 'boxing wizards');
+			await releaseDrag(tab2);
+		})(),
+	]);
+
+	// Both should land on the plugin — no overwrite.
+	await expect.poll(
+		async () => (await realPlugin.getHighlights(articleUrl)).length,
+		{ intervals: [50, 100, 200, 500], timeout: 5000 }
+	).toBe(2);
+
+	const texts = (await realPlugin.getHighlights(articleUrl)).map(h => h.exactText);
+	expect(texts.some(t => t.includes('quick brown fox'))).toBe(true);
+	expect(texts.some(t => t.includes('boxing wizards'))).toBe(true);
+
+	// Each tab should see both highlights (via SSE propagation).
+	await waitForMarkWithText(tab1, 'quick brown fox');
+	await waitForMarkWithText(tab1, 'boxing wizards');
+	await waitForMarkWithText(tab2, 'quick brown fox');
+	await waitForMarkWithText(tab2, 'boxing wizards');
+});
+
+// ── Prefix/suffix disambiguation ────────────────────────────
+//
+// When the same exactText appears multiple times in the page, the
+// prefix/suffix context disambiguates which occurrence the highlight
+// belongs to. This tests that findTextRange picks the right one.
+
+test('prefix/suffix disambiguation: highlight lands on the correct occurrence', async ({
+	page, articleUrl, realPlugin,
+}) => {
+	// The fixture has "quick brown fox" in p1 and the plugin note has the
+	// same text. We plant two highlights with the same exactText but
+	// different prefix/suffix to target different sentences.
+	//
+	// p1: "The quick brown fox jumps over the lazy dog."
+	// The word "The" appears at the start of p1 and also elsewhere.
+	// Let's use a text that appears in the fixture's plugin note in a
+	// controlled way. The fixture article has unique paragraph text, so
+	// we'll use two highlights on the same word "jump" which appears in
+	// p1 ("fox jumps") and p2 ("wizards jump quickly").
+
+	const id1 = 'disambig-a-' + Date.now();
+	const id2 = 'disambig-b-' + Date.now();
+
+	await realPlugin.addHighlight(articleUrl, {
+		id: id1,
+		exactText: 'jump',
+		prefixText: 'fox ',
+		suffixText: 's over',
+	});
+	await realPlugin.addHighlight(articleUrl, {
+		id: id2,
+		exactText: 'jump',
+		prefixText: 'wizards ',
+		suffixText: ' quickly',
+	});
+
+	await page.goto(articleUrl);
+	await page.waitForTimeout(1500);
+
+	// Both marks should exist.
+	const marks = await page.evaluate(() => {
+		const all = document.querySelectorAll('.reading-selection-highlight-mark');
+		return Array.from(all).map(m => ({
+			id: m.getAttribute('data-highlight-id'),
+			parentId: m.closest('[id]')?.id,
+		}));
+	});
+
+	// Each highlight should land in a different paragraph.
+	const mark1 = marks.find(m => m.id === id1);
+	const mark2 = marks.find(m => m.id === id2);
+	expect(mark1, 'first "jump" highlight should be anchored').toBeDefined();
+	expect(mark2, 'second "jump" highlight should be anchored').toBeDefined();
+	expect(mark1!.parentId).toBe('p1');
+	expect(mark2!.parentId).toBe('p2');
+});
