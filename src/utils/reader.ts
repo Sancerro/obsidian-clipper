@@ -6,7 +6,7 @@ import { getLocalStorage, setLocalStorage } from './storage-utils';
 import hljs from 'highlight.js';
 import { getDomain } from './string-utils';
 import { toggleHighlighterMenu } from './highlighter';
-import { attachMarkClickHandler, cacheHighlight, cacheHighlights, clearReaderHighlights, findTextRange, flushPendingRemoteHighlightRemovals, getCachedHighlight, loadReaderHighlights, queueRemoteHighlightRemoval, recordHighlightOp, removeReaderHighlight, uncacheHighlight, wrapRangeInMarks, loadAndApplyPageHighlights, wirePageMarkClickHandlers, getCleanTextContent, startPageHighlightSync, stopPageHighlightSync, subscribeHighlightChanges, type HighlightSync, type ReaderHighlightData } from './reader-highlights';
+import { attachMarkClickHandler, cacheHighlight, cacheHighlights, clearReaderHighlights, findTextRange, flushPendingRemoteHighlightRemovals, getCachedHighlight, loadReaderHighlights, queueRemoteHighlightRemoval, recordHighlightOp, removeReaderHighlight, uncacheHighlight, wrapRangeInMarks, loadAndApplyPageHighlights, wirePageMarkClickHandlers, getCleanTextContent, startPageHighlightSync, stopPageHighlightSync, subscribeHighlightChanges, showReaderToast, type HighlightSync, type ReaderHighlightData } from './reader-highlights';
 import { getPluginErrorMessage, pluginFetch } from './plugin-url';
 import { copyToClipboard } from './clipboard-utils';
 import { getMessage, initializeI18n } from './i18n';
@@ -786,6 +786,22 @@ export class Reader {
 			showPluginStatusToast(false);
 		}
 
+		// Work around Defuddle's "-comment" partial-selector false positive.
+		// Defuddle's PARTIAL_SELECTORS list (node_modules/defuddle/dist/constants.js)
+		// includes the substring "-comment" to strip comment sections. Wikipedia
+		// wraps phonetic pronunciation tooltips in `<span class="rt-commentedText">`
+		// ("rt" = ruby text / annotation), and "-comment" matches that class,
+		// causing the whole wrapper — including the IPA transcription inside —
+		// to get removed. Example: /əˈpɒkrɪfə/ on en.wikipedia.org/wiki/Apocrypha
+		// disappears in reader mode. Stripping just the offending class on the
+		// source doc before Defuddle runs preserves the inner structure without
+		// touching any other extraction logic. Doing this only here (reader mode)
+		// is enough because auto-clip later reads from the already-extracted
+		// `<article>` element and inherits the fix.
+		doc.querySelectorAll('.rt-commentedText').forEach(el => {
+			el.classList.remove('rt-commentedText');
+		});
+
 		const defuddle = new Defuddle(doc, { url: doc.URL });
 		const defuddled = await defuddle.parseAsync();
 
@@ -850,34 +866,48 @@ export class Reader {
 
 		const title = doc.querySelector('h1')?.textContent?.trim() || document.title || 'Untitled';
 		const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+		const author = doc.documentElement.dataset.readerAuthor || '';
+		const domain = doc.documentElement.dataset.readerDomain || '';
 
-		// Convert article HTML to markdown
+		// Convert article HTML to markdown — uses the createMarkdownContent
+		// re-exported from reader-highlights.ts (already statically imported).
 		const { createMarkdownContent } = await import('defuddle/full');
 		const markdown = createMarkdownContent(article.innerHTML, url);
+		// Note: this dynamic import is fine in reader.ts because reader-script.js
+		// loads via chrome.scripting.executeScript (not content_scripts), so
+		// webpack chunk loading works. reader-highlights.ts can't use dynamic
+		// imports because it's also bundled into content.js where chunk loading
+		// fails in the isolated world.
+
+		// Organize into subfolders: author if available, domain as fallback.
+		const subfolder = (author || domain).replace(/[\\/:*?"<>|]/g, '-').trim();
+		const savePath = subfolder ? `Clippings/${subfolder}` : 'Clippings';
 
 		// Build frontmatter
 		const now = new Date().toISOString().split('T')[0];
-		const fileContent = [
+		const frontmatterLines = [
 			'---',
 			`title: "${title.replace(/"/g, '\\"')}"`,
 			`source: "${url}"`,
+		];
+		if (author) frontmatterLines.push(`author: "${author.replace(/"/g, '\\"')}"`);
+		frontmatterLines.push(
 			`created: ${now}`,
 			'tags:',
 			'  - clippings',
 			'---',
-			'',
-			markdown
-		].join('\n');
+		);
+		const fileContent = [...frontmatterLines, '', markdown].join('\n');
 
 		// Save via plugin
-		const sanitizedTitle = title.replace(/[\\/:*?"<>|]/g, '-').slice(0, 200);
+		const sanitizedTitle = title.replace(/[\\/:*?"<>|]/g, '-').slice(0, 200).trim() || 'Untitled';
 		try {
 			const res = await pluginFetch('/clip', {
 				method: 'POST',
 				body: {
 					fileContent,
 					noteName: sanitizedTitle,
-					path: 'Clippings',
+					path: savePath,
 					sourceUrl: url,
 					behavior: 'create'
 				}
@@ -886,7 +916,7 @@ export class Reader {
 				this.showToast(doc, 'Saved to Obsidian');
 				// Set up the note link so highlights sync going forward
 				const data = res.data as { filePath?: string };
-				if (data.filePath) {
+				if (data?.filePath) {
 					doc.documentElement.setAttribute('data-obsidian-note-path', data.filePath);
 				}
 			} else {
@@ -902,20 +932,8 @@ export class Reader {
 		}
 	}
 
-	private static showToast(doc: Document, message: string, isError = false): void {
-		const existing = doc.getElementById('obsidian-reader-toast');
-		if (existing) existing.remove();
-		const toast = doc.createElement('div');
-		toast.id = 'obsidian-reader-toast';
-		toast.textContent = message;
-		const bg = isError ? '#4a2a2a' : '#2a4a2a';
-		toast.style.cssText = `position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:${bg};color:#e0e0e0;padding:8px 16px;border-radius:8px;font:13px/1.4 system-ui,sans-serif;z-index:999999999;opacity:0;transition:opacity 0.3s;pointer-events:none;`;
-		doc.body.appendChild(toast);
-		requestAnimationFrame(() => { toast.style.opacity = '1'; });
-		setTimeout(() => {
-			toast.style.opacity = '0';
-			setTimeout(() => toast.remove(), 300);
-		}, 2000);
+	private static showToast(_doc: Document, message: string, isError = false): void {
+		showReaderToast(message, isError);
 	}
 
 	private static showStaleContentBanner(doc: Document, main: HTMLElement, pageModified: string): void {
@@ -2301,6 +2319,15 @@ export class Reader {
 				doc.documentElement.setAttribute('data-reader-extractor', extractorType);
 			}
 
+			// Store author and domain so quickSave / autoClip can organize
+			// into per-author (or per-domain fallback) folders.
+			if (author) {
+				doc.documentElement.setAttribute('data-reader-author', author);
+			}
+			if (domain) {
+				doc.documentElement.setAttribute('data-reader-domain', domain);
+			}
+
 			// Store note path for Obsidian note pages
 			if (extractorType === 'obsidian-note' && notePath) {
 				doc.documentElement.setAttribute('data-obsidian-note-path', notePath);
@@ -2754,6 +2781,8 @@ export class Reader {
 		// Clean up highlight polling
 		this.stopHighlightStream();
 		doc.documentElement.removeAttribute('data-obsidian-note-path');
+		doc.documentElement.removeAttribute('data-reader-author');
+		doc.documentElement.removeAttribute('data-reader-domain');
 
 		if (this.originalHTML) {
 			// Disconnect the observer if it exists
