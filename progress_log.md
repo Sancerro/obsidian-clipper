@@ -175,3 +175,175 @@ Codex identified responsibility and coupling issues. Refactored:
   - Reader mode is toggled via a service-worker `evaluate` that calls `chrome.scripting.executeScript('reader-script.js')` + `chrome.tabs.sendMessage('toggleReaderMode')` — same plumbing as before, still works with the real plugin.
 - **Full suite runs in ~28s against the real plugin**, all 19 tests passing. Run with `bun run test:e2e`. Requires Obsidian running with the plugin enabled on `:27124`; preflight fails fast otherwise.
 - The test note in `E2E/e2e-test-fixture.md` is the one intentional side effect of running the suite — it lives in the vault forever. If you ever delete it, the next test run will re-create it via `/clip`.
+
+## 2026-04-11
+
+### Drag-selection preview color mismatch
+
+- User report: "when selecting text, the color is not the same as the actual highlight" — during drag, the yellow looked more saturated/less translucent than the applied `.reading-selection-highlight-mark`.
+- Root cause: two different compositing paths. The applied mark sets `background: rgba(255,220,50,0.25)` on an inline `<mark>`, so text glyphs render at full opacity **over** the yellow plate. The drag preview was an absolutely-positioned `<div class="obsidian-selection-preview">` with `z-index: 999999997`, painted **on top** of the text — so the 0.25 yellow also tinted the black glyphs toward olive, pushing overall saturation up.
+- Also a shape mismatch: preview was a rect with `+4px` padding, `border-bottom: 2px solid`, no `border-radius`. Mark has `border-radius: 0.08em`, `box-decoration-break: clone`, and an em-scaled `box-shadow: inset 0 -0.1em 0` underline.
+- **Considered and rejected — CSS Custom Highlight API** (`CSS.highlights.set()` + `::highlight(name)`). Would be the "right" fix — but Firefox only got it in 140, and the extension targets `strict_min_version: 113.0`. Hard no.
+- **Considered and rejected — wrap inline `<span>`s on every `selectionchange`.** DOM mutation while the user is mid-drag risks invalidating the live `Selection` ranges the browser is tracking. Fragile.
+- **Fix (shipped): paint the preview via `::selection`.** Replaced `body.obsidian-highlighter-active *::selection { background-color: transparent !important }` with:
+  ```scss
+  background-color: rgba(255, 220, 50, 0.25) !important;
+  color: inherit !important;
+  text-decoration: underline 0.1em rgba(230, 180, 0, 0.9) !important;
+  text-underline-offset: -0.05em !important;
+  ```
+  Native browser selection painting composites the yellow **behind** the glyphs (same z-order as the mark's `background`), so drag and applied read identically. `text-decoration: underline 0.1em` approximates the mark's inset `box-shadow` bottom-bar — not pixel-identical but visually very close and within what `::selection` is allowed to style (CSS Pseudo-Elements L4).
+- Ripped out the now-dead overlay preview code: deleted `handleSelectionChange`, `removeSelectionPreview`, `selectionPreviewElements` state, and the `.obsidian-selection-preview` CSS class. Removed the `selectionchange` listener from `toggleHighlighterMenu`, removed the `removeSelectionPreview()` call in `handleMouseUp`, and cleaned up the imports in `src/utils/highlighter.ts`.
+- `handleReaderModeHighlight` already calls `selection.removeAllRanges()` at `src/utils/reader-highlights.ts:310` after wrapping, so the `::selection` yellow dissolves cleanly the instant the mark appears — no flicker, no stacking.
+- Reader-mode precedence: `.obsidian-reader-active body ::selection` in `reader.scss` has the same specificity as `body.obsidian-highlighter-active *::selection`, but `!important` on the highlighter rule wins regardless of load order. Same pattern as the old transparent override.
+
+### Follow-up: drag-preview double-dip on bolded text
+
+- User reported: selecting a range that contains a `<strong>` shows the bold portion visibly darker/thicker than the surrounding non-bold selection while the mouse is held. Fine once released.
+- First diagnosis (wrong): assumed it was drag-over-existing-mark stacking (::selection bg on top of an existing mark's bg). Added a `.reading-selection-highlight-mark::selection { background: transparent }` rule. User pushed back: the text wasn't previously marked, and the merge path handles that case anyway.
+- Actual cause: `text-decoration: underline 0.1em` on the `*::selection` rule from the previous fix. The underline stacks on nested inline elements during selection:
+  - `<p>::selection` draws an underline on the direct text ("of " and "."), and per CSS text-decoration propagation, that underline is rendered **through** inline descendants too.
+  - `<strong>::selection` **also** draws its own underline on the bold text because the `*::selection` rule matches every element.
+  - Result on the `<strong>` portion: two underlines stacked at slightly different y-positions (bold metrics shift the underline offset), reading visually as a thicker/darker yellow band. Combined with the bold glyphs being heavier, the whole bold region looks "double-highlighted".
+- **Fix**: dropped `text-decoration` from `::selection` entirely. Drag preview is now just the yellow background — no underline during hold. The applied `.reading-selection-highlight-mark` still has its `box-shadow: inset 0 -0.1em 0` underline after release, so the underline simply appears on commit rather than during drag. Minor transition instead of stacked artifacts.
+- Reverted the `.reading-selection-highlight-mark::selection` rule from the first (wrong) diagnosis — not needed.
+- Second cleanup pass on the `::selection` rule: dropped `!important` from `background-color` and `color`. `body.obsidian-highlighter-active *::selection` has specificity (0,1,2) — enough to beat plain `::selection` (0,0,1) on any site, and source-order wins for content-script CSS. The `!important` was cargo from the original transparent-override and wasn't earning its keep once the rule was doing real painting.
+
+### Disconnected marks across inline `<code>` (and other phrasing elements)
+
+- User report: highlighting a range that spans "result of <code>2.0 * 0.5</code>. Every" renders as three separate rounded marks with visible gaps on either side of the `<code>` — because the code has its own padding/border and the mark is wrapped INSIDE the code at the text node level, not around it.
+- Root cause: `wrapRangeInMarks` in `src/utils/reader-highlights.ts` had a **reader-mode-only** coalescing branch that absorbs fully-marked inline elements (`<code>`, `<strong>`, `<em>`, `<a>`, etc. — anything in `INLINE_TAGS`) into the preceding mark. On page mode, only "safe" coalescing ran (adjacent mark spans + whitespace), so nothing bridged the gap around the `<code>`.
+- The comment said the split was "safe" vs "full" but didn't justify why page mode was restricted. Assessment: the absorbed elements are all phrasing content, legal children of `<span>`, and styled by tag/class (not by parent combinators) in essentially all modern CSS — Tailwind in particular won't notice. The only way this breaks is a site using a direct-child combinator (`p > code`) against the absorbed element's original parent, which is rare enough that connected highlights are the better default.
+- **Fix**: removed the `isReaderMode` guard on the inline-absorb rule in `wrapRangeInMarks` (`src/utils/reader-highlights.ts:564-620`). Rule now runs on both reader and page mode. Renamed the three rules from "safe/reader-only" to "Rule 1/2/3" with a rationale comment. Also affects the load path (`applyHighlightMarks` → `wrapRangeInMarks`), so stored highlights across code elements will reapply as continuous marks too.
+
+### Chrome/Safari: highlighter.css never loaded (marks invisible)
+
+- User loaded the Chrome dev build and reported "highlights don't exist on web version". Marks were created in the DOM, plugin sync was working, but nothing was visible.
+- Root cause: a pre-existing bug from commit `0549f33 "Improve highlight sync and error handling"` (Apr 10). That refactor removed the `ensureHighlighterCSS()` lazy-loader function (originally added in upstream `1b96adb "Lazy highlights (#768)"`) and all its call sites — but never re-added the static `"css": ["highlighter.css"]` entry to `src/manifest.chrome.json` or `src/manifest.safari.json`. Net effect: on Chrome and Safari, `highlighter.css` was never loaded via any path, so `.reading-selection-highlight-mark` had no CSS at all. Marks rendered as plain invisible spans. Firefox was fine because `src/manifest.firefox.json` still has the static CSS entry.
+- **Fix**: re-added `"css": ["highlighter.css"]` to the `content_scripts[0]` entry of both `src/manifest.chrome.json` and `src/manifest.safari.json`, matching the Firefox manifest. This is the simplest repair — it matches what existed prior to the upstream Lazy Highlights PR, and the user had already rejected (by removing) the lazy-loader path.
+- Unrelated but visible in the same debug pass: `[AutoClip] extract failed` errors after each highlight. That's an orthogonal failure in `autoClipPage` — `extractPageMarkdown` message handler in `content.ts:221` is getting a Defuddle parse failure on ngrok.com. Highlight creation itself is unaffected, just the auto-clip-on-first-highlight side effect. Not fixing here.
+
+### Page-mode coalescing regression on links
+
+- While writing e2e regression tests for the coalescing fix, discovered that extending Rule 3 (absorb fully-marked inline elements) to page mode broke `sync.spec.ts`'s `page+highlighter mode: clicking a highlighted link keeps the highlight` test. That test highlights "about linked foxes" across a `<p>` → `<a>` → `<p>` boundary and asserts `link.querySelector('.reading-selection-highlight-mark')` returns non-null (i.e. the link element CONTAINS a mark).
+- After Rule 3, page mode absorbs the `<a>` into the preceding mark, flipping the parent/child relationship: the mark now contains the `<a>`, not the other way around. The test's assertion inverts.
+- **Fix**: Rule 3 on the original page explicitly SKIPS `<a>` elements. Reader mode keeps full absorption for `<a>` too, because reader mode reparses the whole document and the click-to-remove flow doesn't depend on anchor structure there. `code`, `strong`, `em`, `span`, etc. still absorb on both modes — that's what the original "disconnected marks across `<code>`" report needs.
+
+### Regression tests for every fix
+
+- User asked for real-deal tests for everything shipped today. Added `e2e/highlight-rendering.spec.ts` with 7 Playwright tests, all running against the real plugin + real unpacked Chromium extension. No mocks.
+  1. `coalesce: selection across <code> produces one continuous mark` — the inline-code-gap bug.
+  2. `coalesce: selection across <strong> produces one continuous mark` — symmetric coverage for bolded phrases.
+  3. `merge from left: new selection starting inside an existing highlight extends it` — the user's originally-reported overlap deletion bug.
+  4. `merge from right: new selection ending inside an existing highlight extends it` — the symmetric case, which is what caught the Range-mutation issue during unwrap.
+  5. `::selection rule: highlighter.css defines yellow bg with no text-decoration` — guards against the drag-preview-color regression AND the bolded-text-underline-stacking regression. Parses `dev/highlighter.css` directly from disk because Chromium refuses `cssRules` access on content-script-injected stylesheets.
+  6. `manifest: chrome, firefox, and safari all load highlighter.css via content_scripts` — guards the static CSS entry across all three manifests so the "marks render invisible on Chrome/Safari" regression can't come back unnoticed.
+  7. `runtime: highlighter.css styles apply on a raw page load` — canary that injects a `.reading-selection-highlight-mark` span on an article page and checks its computed `background-color` matches the expected rgba. Guards against runtime-level failures (declarativeNetRequest, invalid match patterns, lazy-loading refactors) where the manifest looks right but the CSS never reaches the page.
+- Added `<p id="p5">` to `e2e/fixtures/article.html` with `<code id="test-code">2.0 * 0.5</code>` and `<strong id="test-strong">lossy compression</strong>` so tests 1 and 2 have a deterministic fixture to target. The existing sync.spec.ts tests use `#p1`-`#p4` so no collision.
+- Added `selectAndTriggerHighlight(page, selector, text)` helper: sets the Selection in the main world, then asks the extension's background service worker to send `highlightSelection` via `chrome.tabs.sendMessage`. This bypasses the synthetic-mouseup path entirely. Discovered while debugging that `document.dispatchEvent(new MouseEvent('mouseup'))` from a `page.evaluate` context in the main world reaches content-script isolated-world listeners inconsistently across selection shapes — the merge-from-right scenario was getting dropped on the floor even though a main-world capture listener saw the event. The `sendMessage` path is deterministic because it's the exact trigger `content.ts:405-412` exposes for programmatic callers.
+- Test suite runs `bun run build:chrome:dev && playwright test`. Against the real plugin + Obsidian on `:27124`, the 7 rendering tests finish in ~3 seconds. The full suite (sync + rendering) is 33 tests, ~22 seconds total.
+
+### Overlap-from-left merge deletes the old highlight instead of merging
+
+- User report: dragging a new selection that started INSIDE an existing highlight (extending leftward past it) caused the old highlight to vanish with no new highlight created.
+- Root cause at `src/utils/reader-highlights.ts:254-265`: the merge branch expanded the new range to cover overlapping marks using `markRange.selectNodeContents(marks[i])`, which anchors markRange at element-level `(mark, 0)` / `(mark, childCount)`. The code then passed those element-level containers into `range.setStart` / `range.setEnd`, so `range.start` ended up as `(mark, 0)` — a boundary pointing at the mark element itself. Immediately afterwards at line 269-271, the mark was unwrapped via `replaceWith(...childNodes)`, which removes the mark element from the DOM. At that instant the range's start container becomes a detached node. `expandRangeToWordBoundaries` skips it (its endContainer check requires a text node), `getRangeCleanText(range)` returns empty, and `wrapRangeInMarks` wraps nothing. Net: old mark deleted, nothing replaces it. The bug only triggered when the new selection's start was inside an existing mark, which matches the "overlap from left" pattern (grabbing the end of an old highlight and dragging further).
+- **Initial fix (incomplete)**: anchored expansion on the mark's first/last text-node descendants. This turned out to be necessary but insufficient.
+- **Second pass** (found while writing tests): the DOM Range mutation rules collapse **any** range boundary whose container is an inclusive descendant of a removed node — even text-node-level boundaries. When `mark.replaceWith(...childNodes)` runs, the text node survives (it gets reparented), but the range holding a boundary on it gets collapsed to `(parent-of-mark, index-of-mark)` — an element-level boundary BEFORE the reparented text node. The range then covers only the text before the mark, not the text that used to be inside it. The symptom in the "merge from right" test was a merged highlight reading "jewels. A " instead of "jewels. A mad boxer shot a quick,".
+- **Final fix**: capture the expanded start/end as raw `(node, offset)` tuples BEFORE the unwrap (NOT as `range.setStart/setEnd` calls, since those go through the same DOM Range mutation rules). Unwrap the marks. Then reconstruct the range via `range.setStart(capturedStart, ...)` / `range.setEnd(capturedEnd, ...)` on the now-reparented text nodes. Used temporary ranges + `.collapsed` check for the boundary comparisons (a collapsed temp range means the two boundaries coincide — i.e. the mark's start/end is equal to the current merged start/end, no expansion needed).
+
+### Midnight theme lost its parchment light variant during rebase
+
+- User report: "light mode doesn't work in midnight, what happened to its light version" — pressing `d` in reader mode (the light/dark toggle at `src/utils/reader.ts:2094-2099`) on the midnight theme had no visible effect. Class flipped correctly; no CSS picked it up.
+- Root cause: the parchment light + near-black dark variant of midnight was originally shipped in commit `7dd38dc "Midnight theme (parchment light / dark), citation toggle, shortcuts"` (Apr 7), with the light values at the top of the rule and dark values nested under `&.theme-dark`. During the rebase tracked by branch `codex/pre-rebase-custom-20260410`, that rule was replaced by commit `5c39263 "Add Midnight reader theme"` — a dark-only reversion with a hard `color-scheme: dark` at the end and no `.theme-dark` block. Net: midnight could never render light because there were no light variables defined, and `color-scheme: dark` also forced form controls / scrollbars to stay dark regardless of class.
+- The `d` shortcut itself works on every other theme (ayu, catppuccin, etc.) because those themes define both variants. Only midnight was missing.
+- **Fix**: restored the full two-variant block in `src/styles/_reader-themes.scss` at `[data-reader-theme="midnight"]`. Light (parchment `#f4f0e8` bg, warm stone `#3a3226` text, muted earthy accents) at the top, dark (`#0d0d0d` bg, `#d4d4d4` text, the original near-black set) inside `&.theme-dark, .theme-dark`. Dropped the standalone `color-scheme: dark;` since it conflicts with the toggle; other themes don't set `color-scheme` either.
+
+## 2026-04-12
+
+### Auto-clip "[AutoClip] extract failed" on ngrok.com (and others)
+
+- User report: `[AutoClip] extract failed {url: 'https://ngrok.com/blog/quantization'}` printed on every highlight. They pushed back on my initial explanation (a Defuddle parse failure) with: "reader mode works though? how can that happen if defuddle is failing. manual save also works, automatic save shouldve done the same as the manual anyway? why the drift." — which was exactly right.
+- Root cause: **four Defuddle call sites, three different behaviors**. I mapped them all:
+  1. `src/utils/reader.ts:789` — reader mode uses `parseAsync()` (no try/catch, no fallback).
+  2. `src/content.ts:303` — popup "Save to Obsidian" (`getPageContent`) uses `parseAsync()` with an 8s timeout, `.catch(() => defuddle.parse())` on any failure.
+  3. `src/content.ts:224` — auto-clip (`extractPageMarkdown`) used **sync `.parse()`** with no fallback.
+  4. `src/content.ts:238` and `src/content.ts:263` — `copyMarkdownToClipboard` and `saveMarkdownToFile` used sync `.parse()` with no fallback.
+- Defuddle's sync `.parse()` can throw on pages where `parseAsync()` succeeds: `parseAsync` awaits async variable extractors (`{{transcript}}`, schema.org resolvers, deferred content) that the sync path can't handle. On the ngrok blog, sync throws, async doesn't. So reader mode (parseAsync) and popup save (parseAsync with fallback) both worked, but auto-clip (sync only) failed, and the mismatch looked like "Defuddle broken" when it was actually "we pick the wrong method here".
+- **Fix**: unified `extractPageMarkdown` in `src/content.ts:221` to use the same parseAsync + 8s timeout + sync fallback pattern as `getPageContent`. Also added the same 3s `flattenShadowDom` race that `getPageContent` uses, so flatten can't hang extract either. `extractPageMarkdown` is called only by `autoClipPage` in `src/utils/reader-highlights.ts:405`, so the fix is contained — no other callers to worry about.
+- Didn't touch paths 4 (copy/save). Those are user-initiated and the user is in a position to notice + retry if they fail; auto-clip is a fire-and-forget side effect that spams logs on every highlight, so it's the one that needs the robustness.
+- Didn't touch path 1 (reader mode). Reader mode *already* uses parseAsync and works per the user's own report; adding a fallback there is a nice-to-have but not this bug.
+
+### Auto-clip should just do what the S button does
+
+- User pushed back on the parseAsync fix: "it should do whatever the s button does". Right call. Running Defuddle at all (sync or async) inside reader mode is redundant — reader mode already extracted and cleaned the article into a top-level `<article>` element. `quickSaveToObsidian` (`reader.ts:841-903`, the S-key shortcut) skips Defuddle entirely and just runs `article.innerHTML` through `createMarkdownContent` from `defuddle/full`. That's why S works where auto-clip didn't: no parse call to fail.
+- **Fix**: rewrote `autoClipPage` in `src/utils/reader-highlights.ts` to mirror `quickSaveToObsidian` exactly when reader mode is active.
+  - Detects reader mode via `document.documentElement.classList.contains('obsidian-reader-active')`.
+  - If active AND an `<article>` element exists: grabs `h1` text as title, strips any text-fragment directive from the URL (`#:~:text=...`), dynamically imports `createMarkdownContent` from `defuddle/full`, converts `article.innerHTML` to markdown directly. No Defuddle parse call.
+  - If NOT in reader mode: falls back to `extractPageMarkdown` message (which now uses parseAsync + sync fallback from yesterday's fix). Preserves existing raw-page auto-clip behavior.
+  - Aligns every detail with quickSave that was drifting: title sanitization (`[\\/:*?"<>|]` + 200-char cap, not the old looser regex), frontmatter layout (multiline with `tags:\n  - clippings` block), date format (`YYYY-MM-DD` not full ISO).
+  - On successful clip, sets `document.documentElement.setAttribute('data-obsidian-note-path', filePath)` from the plugin response — same as quickSave does. Prevents auto-clip from firing again on the same page and makes the S key's "Already saved to Obsidian" guard trigger correctly if the user hits S after auto-clip.
+  - Added an early `dataset.obsidianNotePath` guard at the top of `autoClipPage` so the function short-circuits on already-linked pages before any work.
+- Net result: highlighting in reader mode on ngrok.com/blog/quantization (or any page where sync Defuddle throws) now creates a clean Obsidian note via the same path the S key uses, with no parse failures in the console.
+
+### Drag-select yellow disappeared in reader mode
+
+- User report: "what did you do to selector styles. its not a highlight anymore when selecting, just the default". Drag-selecting text in reader mode showed the reader theme's (muted blue/grey) selection color instead of the highlight yellow.
+- Root cause: a regression I introduced on 2026-04-11 when I dropped `!important` from the `*::selection` rule in `src/highlighter.scss`. My note at the time claimed "`body.obsidian-highlighter-active *::selection` has specificity (0,1,2) — enough to beat plain `::selection` (0,0,1) on any site, and source-order wins for content-script CSS." That was only true for the raw-page case. Inside reader mode, `src/reader.scss:169-171` has `.obsidian-reader-active body ::selection { background-color: var(--text-selection); }`, which is NOT a "plain" `::selection` — it nests under `.obsidian-reader-active body`, giving it specificity (0,1,2), the exact same as the highlighter rule.
+- Both rules match inside reader mode when the highlighter is active. With equal specificity, source order decides. `reader.scss` is injected via `chrome.scripting.insertCSS` *after* `highlighter.scss` loads via `content_scripts`, so reader.scss wins — and the theme's `var(--text-selection)` (a muted blue) paints the drag selection instead of the yellow. On raw pages outside reader mode, reader.scss isn't loaded, so the highlighter rule wins — which is why the bug only showed up inside reader mode.
+- **Fix**: restored `background-color: ... !important; color: ... !important;` on `body.obsidian-highlighter-active *::selection` in `src/highlighter.scss:158-164`. Added a load-bearing comment explaining exactly why the `!important` is not cargo and must not be removed again.
+- Didn't touch reader.scss. `.obsidian-reader-active body ::selection` still governs selection color in reader mode when the highlighter is off, which is the correct default — users who just enter reader mode without intending to highlight get the theme's selection color. Only when highlighter is on should the yellow override kick in, and `!important` on the highlighter rule is the narrowest fix that achieves that.
+
+### Wikipedia phonetic pronunciations disappeared in reader mode
+
+- User report: "wikipedia linked phonetics don't appear on reader mode. like /əˈpɒkrɪfə/ from https://en.wikipedia.org/wiki/Apocrypha".
+- Root cause: Defuddle's partial-selector clutter removal pass has a false positive on Wikipedia's pronunciation markup. Bisected the Defuddle pipeline by flipping each removal pass off in isolation:
+  | Option flipped off | IPA preserved? |
+  |---|---|
+  | default (everything on) | NO |
+  | `removeHiddenElements: false` | NO |
+  | `removePartialSelectors: false` | **YES** |
+  | `removeLowScoring: false` | NO |
+  | `standardize: false` | NO |
+  Turning on debug mode and filtering the removals list for entries whose `text` contained the phonetic string produced a single hit:
+  ```
+  step: removeBySelector | selector: -comment | reason: partial match: -comment
+  text: "/əˈpɒkrɪfə/"
+  ```
+  The pattern `'-comment'` at `node_modules/defuddle/dist/constants.js:394` is meant to strip comment sections (`post-comments`, `user-comment-box`, etc.). Wikipedia wraps phonetic pronunciation tooltips in `<span class="rt-commentedText nowrap">` where `rt` stands for "ruby text" (phonetic annotation) and `commentedText` means "text that has a tooltip annotation", not "user comment". The substring `-comment` inside `rt-commentedText` is a false positive — Defuddle sees the class and strips the whole span, taking the IPA inside with it.
+- Verified the diagnosis end-to-end: pulled the real Wikipedia page via curl, ran it through Defuddle locally via `linkedom + node_modules/defuddle/dist/index.full.js`, confirmed the IPA is stripped. Then verified the fix: stripping only the `rt-commentedText` class from offending nodes before running Defuddle preserves the full phonetic transcription including the inner `<a href="/wiki/Help:IPA/English">` link structure.
+- **Fix**: added a two-line DOM prep step in `Reader.extractContent()` at `src/utils/reader.ts:789`, immediately before the `new Defuddle(doc, ...)` call:
+  ```ts
+  doc.querySelectorAll('.rt-commentedText').forEach(el => {
+      el.classList.remove('rt-commentedText');
+  });
+  ```
+  Just the one class is removed; the rest of the markup (span nesting, `IPA`, `nopopups`, `noexcerpt` classes, `lang="en-fonipa"` attribute, the nested per-character `<span title="...">` structure) is untouched. Defuddle then no longer matches the wrapper via partial selectors, leaves the IPA in the extracted content, and reader mode renders it normally.
+- Didn't fork Defuddle or monkey-patch its PARTIAL_SELECTORS list. The fix is narrow, obvious, and located exactly where it matters — if another site's pronunciation or annotation wrapper gets caught by a different false-positive pattern, we can extend this block with another `querySelectorAll().classList.remove()` line.
+- Auto-clip inherits the fix for free: it now reads from the already-extracted `<article>` element (the S-key path from earlier today), which is produced by the same reader-mode Defuddle run that now preserves the IPA.
+
+### Regression tests for all changes today
+
+- Added 4 new tests covering every fix shipped today. Full suite: 36 tests, 20.6 seconds, all passing.
+  1. **`::selection rule: !important assertions`** — updated existing `highlight-rendering.spec.ts` test to verify `background-color` and `color` both have `!important` in the compiled `dev/highlighter.css`. Guards against the reader-mode same-specificity cascade regression.
+  2. **`midnight theme: both parchment-light and near-black-dark CSS variables defined`** — static test in `highlight-rendering.spec.ts` that parses `src/styles/_reader-themes.scss`, verifies the midnight block contains both `#f4f0e8` (parchment light) and `#0d0d0d` (near-black dark) variables, and does NOT have a standalone `color-scheme: dark` (the revert's bug). Guards against the rebase regression.
+  3. **`midnight theme: d-key toggles between parchment-light and near-black-dark`** — runtime test in `sync.spec.ts`. Enters reader mode, sets midnight theme + `theme-light` class, asserts computed bg is `rgb(244, 240, 232)`, presses `d`, asserts bg changes to `rgb(13, 13, 13)`, presses `d` again, asserts it toggles back. End-to-end proof that the CSS variables AND the keydown handler both work.
+  4. **`Wikipedia IPA phonetics survive reader-mode extraction`** — runtime test in `sync.spec.ts`. Loads a new `e2e/fixtures/wikipedia-ipa.html` fixture with real Wikipedia IPA markup (`<span class="rt-commentedText"><span class="IPA">...</span></span>`). This URL is NOT linked to any vault note, so reader mode falls through to Defuddle. Asserts the IPA characters (`ə`, `ɒ`, `krɪf`) are present in the extracted article, and that the parentheses after "Apocrypha" are not empty.
+- New fixture: `e2e/fixtures/wikipedia-ipa.html` — minimal page with the exact Wikipedia `<span class="rt-commentedText nowrap">` → `<span class="IPA nopopups noexcerpt">` → per-character `<span title="...">` structure for `/əˈpɒkrɪfə/`. Not linked to any vault note so Defuddle extraction runs.
+- Test gotcha: Defuddle's standardization pass inserts spaces between the single-character `<span>` elements, so `textContent` has `ə ˈ p ɒ k r ɪ f ə` (spaced). The test strips whitespace before checking character substrings, so it's tolerant of Defuddle's formatting without being too loose.
+
+### Auto-clip toast unified with S-key toast
+- Auto-clip was using `showPluginOfflineToast` (grey `#1a1a1a` bg, different ID/timing) while the S-key used `Reader.showToast` (green `#2a4a2a` bg). Unified by extracting `showReaderToast(message, isError?)` in `reader-highlights.ts` — same look, same ID (`obsidian-reader-toast`), same 2s duration. Both auto-clip and S-key now use it. `Reader.showToast` delegates to the shared function.
+
+### YouTube embed: strip playlist params to prevent auto-advance
+- User report: "in youtube view sometimes the video changes to next video by itself, not even changing the transcripts" — happens at the START of the video, not the end. Root cause: the YouTube iframe embed URL includes `list=` (playlist ID) and `index=` params. YouTube's embed player sees the playlist context and can auto-advance on load. The transcript is baked for a single video.
+- Fix: strip `list` and `index` params from the iframe URL in `src/utils/reader-transcript.ts:119-122` when setting up the JS API. Forces the embed to play just the single video.
+
+### Clippings organized into per-author (or per-domain) subfolders
+- User request: "when we are saving things, things go to their related folder, like same author goes to its own folder"
+- Changes:
+  - **`reader.ts`**: after Defuddle extraction resolves, store `data-reader-author` and `data-reader-domain` on `documentElement` so the save paths can read them.
+  - **`quickSaveToObsidian`** (S key): reads `dataset.readerAuthor` / `dataset.readerDomain`. Computes `savePath = Clippings/${author || domain}` (falls back to `Clippings/` if neither available). Also adds `author` field to frontmatter when present.
+  - **`autoClipPage`** (first-highlight auto-save): same logic — reads the data attributes, uses `author || domain` for subfolder, adds `author` to frontmatter.
+  - Both paths sanitize the subfolder name with the same `[\\/:*?"<>|]` character set as the title.
+  - Attributes cleaned up in `reader.ts:restore()` on reader mode exit.
+- Examples: an article by "John Gruber" on daringfireball.net → `Clippings/John Gruber/article.md`. A page with no author on reddit.com → `Clippings/reddit.com/article.md`. A page with neither → `Clippings/article.md`.
