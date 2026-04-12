@@ -382,23 +382,42 @@
 }
 
 .obsidian-reader-active[data-reader-theme="midnight"] {
-	--background-primary: #0d0d0d;
-	--background-primary-alt: #141414;
-	--text-normal: #d4d4d4;
-	--text-muted: #858585;
-	--text-faint: #525252;
-	--text-accent: #d4d4d4;
-	--text-accent-hover: #e0e0e0;
-	--background-modifier-border: #252525;
-	--text-selection: rgba(255, 255, 255, 0.08);
-	--color-red: #e06c75;
-	--color-orange: #d19a66;
-	--color-yellow: #e5c07b;
-	--color-green: #98c379;
-	--color-cyan: #56b6c2;
-	--color-blue: #a0b8cf;
-	--color-purple: #c0a0dc;
-	--color-pink: #d4a0b8;
+	--background-primary: #f4f0e8;
+	--background-primary-alt: #ece7dc;
+	--text-normal: #3a3226;
+	--text-muted: #7a6f60;
+	--text-faint: #a69d8e;
+	--text-accent: #3a3226;
+	--text-accent-hover: #6b4226;
+	--background-modifier-border: #d8d0c2;
+	--text-selection: rgba(139, 90, 43, 0.15);
+	--color-red: #a03030;
+	--color-orange: #a06030;
+	--color-yellow: #8a7520;
+	--color-green: #4a7a3a;
+	--color-cyan: #3a7a7a;
+	--color-blue: #4a6a8a;
+	--color-purple: #6a4a8a;
+	--color-pink: #8a4a6a;
 
-	color-scheme: dark;
+	&.theme-dark,
+	.theme-dark {
+		--background-primary: #0d0d0d;
+		--background-primary-alt: #141414;
+		--text-normal: #d4d4d4;
+		--text-muted: #858585;
+		--text-faint: #525252;
+		--text-accent: #d4d4d4;
+		--text-accent-hover: #e0e0e0;
+		--background-modifier-border: #252525;
+		--text-selection: rgba(255, 255, 255, 0.08);
+		--color-red: #e06c75;
+		--color-orange: #d19a66;
+		--color-yellow: #e5c07b;
+		--color-green: #98c379;
+		--color-cyan: #56b6c2;
+		--color-blue: #a0b8cf;
+		--color-purple: #c0a0dc;
+		--color-pink: #d4a0b8;
+	}
 }
