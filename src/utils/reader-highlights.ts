@@ -6,6 +6,8 @@
 import browser from './browser-polyfill';
 import { getPluginErrorMessage, pluginFetch } from './plugin-url';
 import { logHandledError } from './error-utils';
+import Defuddle from 'defuddle';
+import { createMarkdownContent as defuddleToMarkdown } from 'defuddle/full';
 
 // ── Types ────────────────────────────────────────────────
 
@@ -247,29 +249,78 @@ export function handleReaderModeHighlight(selection: Selection): void {
 
 	const url = window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
 
-	// Merge with any overlapping existing highlights
+	// Merge with any overlapping existing highlights.
+	//
+	// Three-step dance to keep the merged range valid across the unwrap:
+	//   (1) Capture the *expanded* start/end as raw (text-node, offset) tuples,
+	//       NOT as `range.setStart/setEnd` calls. The DOM Range mutation rules
+	//       kick in during `replaceWith(...childNodes)` below: when the mark
+	//       is removed, any range boundary whose container is an inclusive
+	//       descendant of the removed node gets collapsed to (parent, index)
+	//       — even though the descendant text node is being reparented
+	//       immediately after, not actually destroyed. So we can't hold the
+	//       boundaries on the live Range through the unwrap.
+	//   (2) Unwrap the marks.
+	//   (3) Reconstruct the range from the raw tuples, which still point at
+	//       the (now-reparented) text nodes.
 	const overlappingIds = findOverlappingHighlightIds(range);
 	if (overlappingIds.length > 0) {
-		// Expand range to cover all overlapping marks
+		// (1) Compute merged boundaries.
+		let startNode: Node = range.startContainer;
+		let startOffset: number = range.startOffset;
+		let endNode: Node = range.endContainer;
+		let endOffset: number = range.endOffset;
+
 		for (const oid of overlappingIds) {
 			const marks = root.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${oid}"]`);
 			for (let i = 0; i < marks.length; i++) {
-				const markRange = document.createRange();
-				markRange.selectNodeContents(marks[i]);
-				if (markRange.compareBoundaryPoints(Range.START_TO_START, range) < 0) {
-					range.setStart(markRange.startContainer, markRange.startOffset);
+				const mark = marks[i];
+				const walker = document.createTreeWalker(mark, NodeFilter.SHOW_TEXT);
+				let firstText: Text | null = null;
+				let lastText: Text | null = null;
+				let textNode: Node | null;
+				while ((textNode = walker.nextNode())) {
+					if (!firstText) firstText = textNode as Text;
+					lastText = textNode as Text;
 				}
-				if (markRange.compareBoundaryPoints(Range.END_TO_END, range) > 0) {
-					range.setEnd(markRange.endContainer, markRange.endOffset);
+				if (!firstText || !lastText) continue;
+
+				// Compare mark's text-level start to the current merged start
+				// via a temporary range.
+				const cmpStart = document.createRange();
+				cmpStart.setStart(firstText, 0);
+				cmpStart.setEnd(startNode, startOffset);
+				// If (firstText, 0) < (startNode, startOffset), the mark's start
+				// is earlier — expand our start to cover it.
+				if (!cmpStart.collapsed) {
+					startNode = firstText;
+					startOffset = 0;
+				}
+
+				const cmpEnd = document.createRange();
+				cmpEnd.setStart(endNode, endOffset);
+				cmpEnd.setEnd(lastText, lastText.length);
+				// If (endNode, endOffset) < (lastText, lastText.length), the
+				// mark's end is later — expand our end to cover it.
+				if (!cmpEnd.collapsed) {
+					endNode = lastText;
+					endOffset = lastText.length;
 				}
 			}
 		}
-		// Remove old marks from DOM
+
+		// (2) Remove old marks from DOM.
 		for (const oid of overlappingIds) {
 			root.querySelectorAll(`.reading-selection-highlight-mark[data-highlight-id="${oid}"]`).forEach(m => {
 				m.replaceWith(...Array.from(m.childNodes));
 			});
 		}
+
+		// (3) Rebuild the range from the captured tuples. The text nodes are
+		// still valid — they were reparented, not destroyed — so setStart/setEnd
+		// lands on the same characters we expanded to.
+		range.setStart(startNode, startOffset);
+		range.setEnd(endNode, endOffset);
 		// Remove old highlights from storage + plugin
 		for (const oid of overlappingIds) {
 			removeReaderHighlight(url, oid);
@@ -346,43 +397,119 @@ export function handleReaderModeHighlight(selection: Selection): void {
 	});
 }
 
-/** Auto-clip the current page to Obsidian on the first highlight (if not already linked). */
+/**
+ * Auto-clip the current page to Obsidian on the first highlight.
+ *
+ * Mirrors the S-key shortcut (`Reader.quickSaveToObsidian` in `reader.ts`)
+ * exactly when reader mode is active: grabs the already-extracted `<article>`
+ * element, runs its `innerHTML` through `createMarkdownContent` directly, and
+ * POSTs to `/clip` with the same frontmatter shape (title / source / created /
+ * tags: clippings). **No Defuddle parse call** — reader mode already cleaned
+ * the article, re-parsing the whole document with Defuddle is redundant AND
+ * can throw on pages where `parseAsync()` succeeded for reader mode but sync
+ * `.parse()` fails (the ngrok.com/blog/* class of bug).
+ *
+ * On non-reader pages (no `<article>` available), fall back to the Defuddle
+ * extract path via `extractPageMarkdown`, which itself uses the parseAsync +
+ * sync fallback pattern.
+ */
 let autoClipInFlight = false;
-async function autoClipPage(url: string): Promise<void> {
+export async function autoClipPage(url: string): Promise<void> {
 	if (autoClipInFlight) return;
+	// Already linked to a note — nothing to auto-clip.
+	if (document.documentElement.dataset.obsidianNotePath) return;
 	autoClipInFlight = true;
 	try {
-		// Ask content script to extract markdown + title (content.ts handles Defuddle)
-		const extract = await browser.runtime.sendMessage({ action: 'extractPageMarkdown' }) as {
-			success: boolean;
-			markdown?: string;
-			title?: string;
-			error?: string;
-		};
-		if (!extract?.success || !extract.markdown) {
-			throw new Error(extract?.error || 'extract failed');
+		// Strip any text-fragment directive so the note's `source` is a clean URL
+		// and the plugin's URL index matches what reader mode stores.
+		const cleanUrl = url.replace(/#:~:text=[^&]+(&|$)/, '');
+
+		const isReaderActive = document.documentElement.classList.contains('obsidian-reader-active');
+		const article = isReaderActive ? document.querySelector('article') : null;
+
+		let title: string;
+		let markdown: string;
+
+		if (article) {
+			// Reader-mode path: identical to quickSaveToObsidian. Title from <h1>,
+			// markdown straight from article.innerHTML via defuddle/full's
+			// createMarkdownContent, no Defuddle parse.
+			const rawTitle = document.querySelector('h1')?.textContent?.trim() || document.title || 'Untitled';
+			title = rawTitle;
+			markdown = defuddleToMarkdown(article.innerHTML, cleanUrl);
+		} else {
+			// Non-reader fallback: run Defuddle directly (we're already in the
+			// content script context). Using runtime.sendMessage won't work —
+			// it goes to the background script which has no handler for
+			// extractPageMarkdown. Static imports are used instead of dynamic
+			// to avoid code-split chunks that content scripts can't load.
+			document.querySelectorAll('.rt-commentedText').forEach(el =>
+				el.classList.remove('rt-commentedText')
+			);
+			const defuddle = new Defuddle(document, { url: document.URL });
+			let timerId: ReturnType<typeof setTimeout>;
+			const parseTimeout = new Promise<never>((_, reject) => {
+				timerId = setTimeout(() => reject(new Error('parseAsync timeout')), 8000);
+			});
+			const defuddled = await Promise.race([defuddle.parseAsync(), parseTimeout])
+				.catch(() => defuddle.parse())
+				.finally(() => clearTimeout(timerId!));
+			markdown = defuddleToMarkdown(defuddled.content, cleanUrl);
+			title = defuddled.title || document.title || 'Untitled';
 		}
 
-		const title = (extract.title || document.title || 'Untitled').replace(/[/\\?%*:|"<>]/g, '-').trim() || 'Untitled';
-		const created = new Date().toISOString();
-		const fileContent = `---\ntitle: "${title.replace(/"/g, '\\"')}"\nsource: "${url}"\ncreated: ${created}\n---\n\n${extract.markdown}`;
+		// Read author/domain stored by reader mode for folder organization.
+		// On raw pages (no reader mode), fall back to extracting domain from URL.
+		const author = document.documentElement.dataset.readerAuthor || '';
+		let domain = document.documentElement.dataset.readerDomain || '';
+		if (!domain) {
+			try { domain = new URL(cleanUrl).hostname.replace(/^www\./, ''); } catch {}
+		}
+
+		// Organize into subfolders: author if available, domain as fallback.
+		const subfolder = (author || domain).replace(/[\\/:*?"<>|]/g, '-').trim();
+		const savePath = subfolder ? `Clippings/${subfolder}` : 'Clippings';
+
+		// Sanitize title the same way quickSave does (character set + 200-char cap).
+		const sanitizedTitle = title.replace(/[\\/:*?"<>|]/g, '-').slice(0, 200).trim() || 'Untitled';
+		const created = new Date().toISOString().split('T')[0];
+		const frontmatterLines = [
+			'---',
+			`title: "${sanitizedTitle.replace(/"/g, '\\"')}"`,
+			`source: "${cleanUrl}"`,
+		];
+		if (author) frontmatterLines.push(`author: "${author.replace(/"/g, '\\"')}"`);
+		frontmatterLines.push(
+			`created: ${created}`,
+			'tags:',
+			'  - clippings',
+			'---',
+		);
+		const fileContent = [...frontmatterLines, '', markdown].join('\n');
 
 		const clipRes = await pluginFetch('/clip', {
 			method: 'POST',
 			body: {
 				fileContent,
-				noteName: title,
-				path: 'Clippings',
-				sourceUrl: url,
+				noteName: sanitizedTitle,
+				path: savePath,
+				sourceUrl: cleanUrl,
 				behavior: 'create',
 			}
 		});
 		if (!clipRes.ok) {
-			logHandledError('AutoClip', clipRes.error || 'Plugin /clip failed', { url, status: clipRes.status });
-			showPluginOfflineToast('Could not auto-clip page to Obsidian');
-		} else {
-			showPluginOfflineToast('Page auto-clipped to Obsidian');
+			logHandledError('AutoClip', clipRes.error || 'Plugin /clip failed', { url: cleanUrl, status: clipRes.status });
+			showReaderToast('Could not save to Obsidian', true);
+			return;
 		}
+		// Mirror quickSave: mark the document as linked so subsequent highlight
+		// posts don't re-trigger auto-clip, and the S-key's "already saved"
+		// guard fires if the user presses it after the auto-clip landed.
+		const data = clipRes.data as { filePath?: string };
+		if (data?.filePath) {
+			document.documentElement.setAttribute('data-obsidian-note-path', data.filePath);
+		}
+		showReaderToast('Saved to Obsidian');
 	} finally {
 		autoClipInFlight = false;
 	}
@@ -561,9 +688,24 @@ export function wrapRangeInMarks(range: Range, className: string, id: string): v
 		nodeRange.surroundContents(mark);
 	}
 
-	// Coalesce adjacent marks.
-	// In reader mode: full coalescing (merge through inline elements).
-	// On original page: safe coalescing only (merge adjacent mark spans + whitespace).
+	// Coalesce adjacent marks. Three merge rules, applied repeatedly until stable:
+	//   1. Absorb whitespace-only text nodes sitting between marks.
+	//   2. Merge adjacent mark spans with the same highlight id.
+	//   3. Absorb fully-marked inline elements (e.g. <code>, <strong>) into
+	//      the preceding mark. Without this, a selection that crosses an inline
+	//      element like "result of <code>2.0 * 0.5</code>. Every" renders as
+	//      three disconnected rounded marks with a gap at each code-padding
+	//      edge. The absorbed inline element becomes a child of the mark span,
+	//      which is legal HTML and preserves the element's own styling.
+	//
+	//   Rule 3 on the original page (not reader mode) specifically EXCLUDES
+	//   <a>: the rest of the clipper treats `.mark inside <a>` as the canonical
+	//   structure for highlighted links — click-to-remove delegates to `target
+	//   closest '.mark'`, and `disableLinkClicks` watches for anchor clicks.
+	//   Moving the <a> inside the mark flips the parent/child relationship and
+	//   breaks the existing "click a highlighted link keeps the highlight" flow.
+	//   Reader mode doesn't care because it reparses the whole document anyway,
+	//   so full absorption (including <a>) stays on there.
 	const isReaderMode = document.documentElement.classList.contains('obsidian-reader-active');
 	const coalRoot = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
 		? range.commonAncestorContainer.parentElement!
@@ -575,7 +717,7 @@ export function wrapRangeInMarks(range: Range, className: string, id: string): v
 		for (const mark of marks) {
 			let next = mark.nextSibling;
 			while (next) {
-				// Safe: absorb whitespace between marks
+				// Rule 1: absorb whitespace between marks
 				if (next instanceof Text && next.nodeValue?.trim() === '') {
 					const ws = next;
 					next = ws.nextSibling;
@@ -583,7 +725,7 @@ export function wrapRangeInMarks(range: Range, className: string, id: string): v
 					changed = true;
 					continue;
 				}
-				// Safe: merge adjacent marks with same ID
+				// Rule 2: merge adjacent marks with same ID
 				if (next instanceof HTMLElement && next.classList.contains(className) && next.dataset.highlightId === id) {
 					while (next.firstChild) mark.appendChild(next.firstChild);
 					const current = next;
@@ -592,8 +734,12 @@ export function wrapRangeInMarks(range: Range, className: string, id: string): v
 					changed = true;
 					continue;
 				}
-				// Reader mode only: absorb inline elements whose text is all marked
-				if (isReaderMode && next instanceof HTMLElement && isInlineElement(next)) {
+				// Rule 3: absorb inline elements whose text is all marked
+				if (
+					next instanceof HTMLElement
+					&& isInlineElement(next)
+					&& (isReaderMode || next.tagName !== 'A')
+				) {
 					const innerMarks = next.querySelectorAll(`.${className}[data-highlight-id="${id}"]`);
 					if (innerMarks.length > 0 && next.textContent?.trim() === Array.from(innerMarks).map(m => m.textContent).join('').trim()) {
 						const el = next;
@@ -1198,6 +1344,23 @@ function showOrphanedHighlightsToast(orphaned: ReaderHighlightData[], url: strin
 }
 
 // ── Toast ────────────────────────────────────────────────
+
+/** Green reader toast — same style as Reader.showToast (S-key "Saved to Obsidian"). */
+export function showReaderToast(message: string, isError = false): void {
+	const existing = document.getElementById('obsidian-reader-toast');
+	if (existing) existing.remove();
+	const toast = document.createElement('div');
+	toast.id = 'obsidian-reader-toast';
+	toast.textContent = message;
+	const bg = isError ? '#4a2a2a' : '#2a4a2a';
+	toast.style.cssText = `position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:${bg};color:#e0e0e0;padding:8px 16px;border-radius:8px;font:13px/1.4 system-ui,sans-serif;z-index:999999999;opacity:0;transition:opacity 0.3s;pointer-events:none;`;
+	document.body.appendChild(toast);
+	requestAnimationFrame(() => { toast.style.opacity = '1'; });
+	setTimeout(() => {
+		toast.style.opacity = '0';
+		setTimeout(() => toast.remove(), 300);
+	}, 2000);
+}
 
 function showPluginOfflineToast(message = 'Obsidian plugin not running — highlights won\'t sync'): void {
 	const existing = document.getElementById('obsidian-plugin-toast');
