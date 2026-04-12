@@ -15,7 +15,6 @@ import { getElementByXPath, isDarkColor } from './dom-utils';
 let touchStartX: number = 0;
 let touchStartY: number = 0;
 let isTouchMoved: boolean = false;
-let selectionPreviewElements: HTMLElement[] = [];
 
 const LINE_BY_LINE_OVERLAY_TAGS = ['P'];
 
@@ -55,7 +54,6 @@ export function handleMouseUp(event: MouseEvent | TouchEvent) {
 		target = document.elementFromPoint(touch.clientX, touch.clientY) as Element;
 	}
 
-	removeSelectionPreview();
 	const selection = window.getSelection();
 	if (selection && !selection.isCollapsed) {
 		handleTextSelection(selection);
@@ -415,38 +413,6 @@ async function handleHighlightClick(event: Event) {
 	} catch (error) {
 		console.error('Error handling highlight click:', error);
 	}
-}
-
-// Live selection preview — renders overlay matching final highlight style during drag
-export function handleSelectionChange() {
-	removeSelectionPreview();
-	const selection = window.getSelection();
-	if (!selection || selection.isCollapsed) return;
-
-	for (let i = 0; i < selection.rangeCount; i++) {
-		const range = selection.getRangeAt(i);
-		const rects = range.getClientRects();
-		for (let j = 0; j < rects.length; j++) {
-			const rect = rects[j];
-			if (rect.width === 0 || rect.height === 0) continue;
-			const el = document.createElement('div');
-			el.className = 'obsidian-selection-preview';
-			el.style.position = 'absolute';
-			el.style.left = `${rect.left + window.scrollX - 2}px`;
-			el.style.top = `${rect.top + window.scrollY - 2}px`;
-			el.style.width = `${rect.width + 4}px`;
-			el.style.height = `${rect.height + 4}px`;
-			el.style.pointerEvents = 'none';
-			el.style.zIndex = '999999997';
-			document.body.appendChild(el);
-			selectionPreviewElements.push(el);
-		}
-	}
-}
-
-export function removeSelectionPreview() {
-	selectionPreviewElements.forEach(el => el.remove());
-	selectionPreviewElements = [];
 }
 
 // Remove all existing highlight overlays from the page

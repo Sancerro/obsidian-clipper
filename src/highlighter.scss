@@ -149,13 +149,22 @@ body.obsidian-highlighter-active {
 
 	// Disable pinch zoom on mobile
 	touch-action: pan-x pan-y;
+	// Live selection preview: paint the yellow via ::selection so it composites
+	// BEHIND the glyphs — same z-order as .reading-selection-highlight-mark's
+	// background, so drag-preview and applied highlight read identically.
+	// No text-decoration: an underline here would stack on nested inline
+	// elements (e.g. <strong>) because both ancestor and descendant
+	// ::selection would each draw one, producing a doubled yellow band.
+	//
+	// !important is load-bearing in reader mode: `.obsidian-reader-active body
+	// ::selection` in reader.scss has the same (0,1,2) specificity as this
+	// rule, and reader.scss is injected later via `chrome.scripting.insertCSS`,
+	// so source-order would otherwise make the reader theme's text-selection
+	// color win. Without !important, drag-select inside reader mode shows the
+	// theme's blue/grey instead of the highlight yellow.
 	*::selection {
-		background-color: transparent !important;
+		background-color: rgba(255, 220, 50, 0.25) !important;
 		color: inherit !important;
-	}
-	.obsidian-selection-preview {
-		background-color: rgba(255, 220, 50, 0.25);
-		border-bottom: 2px solid rgba(230, 180, 0, 0.9);
 	}
 	.obsidian-highlight-overlay {
 		cursor: pointer;

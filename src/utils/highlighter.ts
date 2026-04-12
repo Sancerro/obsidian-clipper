@@ -9,8 +9,6 @@ import {
 	removeExistingHighlights,
 	handleTouchStart,
 	handleTouchMove,
-	handleSelectionChange,
-	removeSelectionPreview,
 	attachOverlayObservers,
 	detachOverlayObservers
 } from './highlighter-overlays';
@@ -142,7 +140,6 @@ export function toggleHighlighterMenu(isActive: boolean) {
 		document.addEventListener('touchmove', handleTouchMove);
 		document.addEventListener('touchend', handleMouseUp);
 		document.addEventListener('keydown', handleKeyDown);
-		document.addEventListener('selectionchange', handleSelectionChange);
 		// In reader mode, CSS handles selection — don't clobber links or start overlay observers
 		if (!isReaderMode) {
 			disableLinkClicks();
@@ -158,8 +155,6 @@ export function toggleHighlighterMenu(isActive: boolean) {
 		document.removeEventListener('touchmove', handleTouchMove);
 		document.removeEventListener('touchend', handleMouseUp);
 		document.removeEventListener('keydown', handleKeyDown);
-		document.removeEventListener('selectionchange', handleSelectionChange);
-		removeSelectionPreview();
 		removeHoverOverlay();
 		detachOverlayObservers();
 		enableLinkClicks();
