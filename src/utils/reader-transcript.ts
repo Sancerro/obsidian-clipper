@@ -119,6 +119,12 @@ export function wireTranscript(
 		const src = new URL(iframe.src);
 		src.searchParams.set('enablejsapi', '1');
 		src.searchParams.set('origin', window.location.origin);
+		// Strip playlist context — the transcript is for a single video, and
+		// keeping the `list` param lets YouTube auto-advance to the next
+		// playlist item on load (even at the start, not just at the end),
+		// leaving the transcript out of sync with whatever video is playing.
+		src.searchParams.delete('list');
+		src.searchParams.delete('index');
 		iframe.src = src.toString();
 
 		// Initialize postMessage connection once iframe loads
