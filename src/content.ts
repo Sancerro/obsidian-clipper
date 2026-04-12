@@ -7,6 +7,7 @@ import { extractContentBySelector as extractContentBySelectorShared } from './ut
 import { createMarkdownContent } from 'defuddle/full';
 import { flattenShadowDom } from './utils/flatten-shadow-dom';
 import { saveFile } from './utils/file-utils';
+import { autoClipPage, showReaderToast } from './utils/reader-highlights';
 
 declare global {
 	interface Window {
@@ -219,9 +220,20 @@ declare global {
 		}
 
 		if (request.action === "extractPageMarkdown") {
-			flattenShadowDom(document).then(() => {
+			// Match the popup "Save to Obsidian" path (getPageContent): parseAsync
+			// with an 8s timeout, fall back to sync parse on timeout or any other
+			// error. Plain sync .parse() throws on pages where parseAsync succeeds
+			// (e.g. ngrok.com/blog/*), so reader mode + manual save work but
+			// auto-clip fails. Unifying the path removes that drift.
+			const flattenTimeout = new Promise<void>(resolve => setTimeout(resolve, 3000));
+			Promise.race([flattenShadowDom(document), flattenTimeout]).then(async () => {
 				try {
-					const defuddled = new Defuddle(document, { url: document.URL }).parse();
+					const defuddle = new Defuddle(document, { url: document.URL });
+					const parseTimeout = new Promise<never>((_, reject) =>
+						setTimeout(() => reject(new Error('parseAsync timeout')), 8000)
+					);
+					const defuddled = await Promise.race([defuddle.parseAsync(), parseTimeout])
+						.catch(() => defuddle.parse());
 					const markdown = createMarkdownContent(defuddled.content, document.URL);
 					sendResponse({ success: true, markdown, title: defuddled.title || document.title });
 				} catch (err) {
@@ -473,6 +485,28 @@ declare global {
 			highlighter.toggleHighlighterMenu(isHighlighterMode);
 			updateHasHighlights();
 			browser.runtime.sendMessage({ action: "highlighterModeChanged", isActive: isHighlighterMode });
+		}
+	});
+
+	// Alt+Shift+S saves the page to Obsidian (non-reader mode).
+	// Reader mode has its own plain 's' shortcut in reader.ts.
+	// Uses e.code ('KeyS') instead of e.key because macOS Option key
+	// composes characters (Option+Shift+S → 'Í' on US layout).
+	document.addEventListener('keydown', (e) => {
+		if (document.documentElement.classList.contains('obsidian-reader-active')) return;
+		if (!e.altKey || !e.shiftKey) return;
+		const tag = (document.activeElement as HTMLElement)?.tagName;
+		if (tag === 'INPUT' || tag === 'TEXTAREA' || (document.activeElement as HTMLElement)?.isContentEditable) return;
+		if (e.code === 'KeyS') {
+			e.preventDefault();
+			if (document.documentElement.dataset.obsidianNotePath) {
+				showReaderToast('Already saved to Obsidian');
+				return;
+			}
+			autoClipPage(window.location.href).catch(err => {
+				console.warn('[AutoClip]', err);
+				showReaderToast('Failed to save to Obsidian', true);
+			});
 		}
 	});
 
