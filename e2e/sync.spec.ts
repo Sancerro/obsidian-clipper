@@ -1134,3 +1134,121 @@ test('multi-highlight: removing one highlight leaves the others intact', async (
 	await waitForMarkWithText(page, 'opal jewels');
 	await waitForMarkGone(page, 'boxing wizards');
 });
+
+// ── Midnight theme d-key toggle ─────────────────────────────
+//
+// Bug: the midnight theme lost its parchment-light CSS variant during a
+// rebase (commit 5c39263 replaced the two-variant block with dark-only +
+// color-scheme: dark). Pressing `d` in reader mode flipped the class but
+// had no visual effect because no light variables existed.
+//
+// Fix: restored both light (parchment #f4f0e8) and dark (#0d0d0d) variants
+// in _reader-themes.scss. This test verifies the runtime behavior: enter
+// reader mode, set midnight theme, press d, and confirm the computed
+// background color actually changes.
+
+test('midnight theme: d-key toggles between parchment-light and near-black-dark', async ({
+	page, articleUrl,
+}) => {
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+
+	// Set the midnight theme and start in light mode.
+	await page.evaluate(() => {
+		const html = document.documentElement;
+		html.setAttribute('data-reader-theme', 'midnight');
+		html.classList.remove('theme-dark');
+		html.classList.add('theme-light');
+	});
+
+	// Wait for CSS variables to cascade.
+	const lightBg = await page.evaluate(() => {
+		return getComputedStyle(document.body).backgroundColor;
+	});
+	// Parchment: #f4f0e8 → rgb(244, 240, 232)
+	expect(lightBg).toMatch(/rgb\(244,\s*240,\s*232\)/);
+
+	// Press 'd' — should toggle to theme-dark.
+	await page.focus('body');
+	await page.keyboard.press('d');
+
+	await page.waitForFunction(() =>
+		document.documentElement.classList.contains('theme-dark')
+	, { timeout: 1000 });
+
+	const darkBg = await page.evaluate(() => {
+		return getComputedStyle(document.body).backgroundColor;
+	});
+	// Near-black: #0d0d0d → rgb(13, 13, 13)
+	expect(darkBg).toMatch(/rgb\(13,\s*13,\s*13\)/);
+
+	// Press 'd' again — should toggle back to theme-light.
+	await page.keyboard.press('d');
+
+	await page.waitForFunction(() =>
+		document.documentElement.classList.contains('theme-light')
+	, { timeout: 1000 });
+
+	const backToLightBg = await page.evaluate(() => {
+		return getComputedStyle(document.body).backgroundColor;
+	});
+	expect(backToLightBg).toMatch(/rgb\(244,\s*240,\s*232\)/);
+});
+
+// ── Wikipedia IPA phonetics survive reader-mode extraction ──
+//
+// Bug: Defuddle's partial-selector removal pass includes "-comment" as a
+// substring pattern (intended to strip comment sections). Wikipedia wraps
+// pronunciation tooltips in `<span class="rt-commentedText">` — "rt" is
+// "ruby text", and "commentedText" means "has a tooltip annotation", not
+// "user comment". The "-comment" substring matched, stripping the wrapper
+// and the IPA transcription (e.g. /əˈpɒkrɪfə/) inside.
+//
+// Fix: before Defuddle runs, reader.ts strips the `rt-commentedText` class
+// from the source DOM so the partial match misses. This test loads a fixture
+// with real Wikipedia IPA markup and confirms the phonetic text survives
+// reader-mode extraction.
+
+test('Wikipedia IPA phonetics survive reader-mode extraction', async ({
+	page,
+}) => {
+	// This URL is NOT linked to any vault note, so reader mode falls through
+	// the plugin's /page endpoint (no notePath) to Defuddle extraction.
+	const ipaUrl = 'http://127.0.0.1:3100/wikipedia-ipa.html';
+	await page.goto(ipaUrl);
+	await enterReaderMode(page);
+
+	// Wait for the article to render.
+	await page.waitForSelector('article', { timeout: 10_000 });
+
+	// The IPA text /əˈpɒkrɪfə/ should be present in the reader article.
+	// Defuddle's standardization pass may insert spaces between the per-
+	// character <span> elements, so check for individual IPA characters
+	// rather than a contiguous substring.
+	const ipaCheck = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { found: false, text: '' };
+		const text = article.textContent || '';
+		// Strip whitespace for the adjacency check — Defuddle inserts spaces
+		// between inline elements during standardization.
+		const stripped = text.replace(/\s+/g, '');
+		return {
+			found: stripped.includes('\u0259') && stripped.includes('\u0252') && stripped.includes('kr\u026Af'),
+			text: text.slice(0, 300),
+		};
+	});
+	expect(ipaCheck.found, `reader mode article must contain IPA characters (got: ${ipaCheck.text.slice(0, 150)})`).toBe(true);
+
+	// Also verify the parentheses aren't empty — the pre-fix symptom was
+	// "Apocrypha () are biblical..." (empty parens where IPA was stripped).
+	const noEmptyParens = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return false;
+		const text = article.textContent || '';
+		// Look for the word Apocrypha followed by something inside parens.
+		// Allow whitespace between characters since Defuddle may insert it.
+		const match = text.match(/Apocrypha\s*\(([^)]*)\)/);
+		return match ? match[1].trim().length > 0 : false;
+	});
+	expect(noEmptyParens, 'parentheses after "Apocrypha" must not be empty').toBe(true);
+});
