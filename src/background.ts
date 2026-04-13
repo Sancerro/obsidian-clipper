@@ -20,7 +20,144 @@ interface HighlightSSESession {
 	closed: boolean;
 }
 
+type MathJaxMacroMap = Record<string, string | [string, number]>;
+type MathJaxConfig = Record<string, unknown>;
+
 const EVENT_SOURCE_AVAILABLE = typeof EventSource !== 'undefined';
+
+function sanitizeMathJaxMacros(raw: unknown): MathJaxMacroMap {
+	const sanitized: MathJaxMacroMap = {};
+	if (!raw || typeof raw !== 'object') return sanitized;
+
+	for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (typeof value === 'string') {
+			sanitized[name] = value;
+			continue;
+		}
+
+		if (Array.isArray(value) && typeof value[0] === 'string') {
+			const argc = typeof value[1] === 'number' ? value[1] : Number(value[1]);
+			sanitized[name] = Number.isFinite(argc) ? [value[0], argc] : value[0];
+		}
+	}
+
+	return sanitized;
+}
+
+async function extractMathJaxMacrosFromTab(tabId: number): Promise<MathJaxMacroMap> {
+	if (typeof chrome === 'undefined' || !chrome.scripting?.executeScript) {
+		return {};
+	}
+
+	const [injection] = await chrome.scripting.executeScript({
+		target: { tabId },
+		world: 'MAIN',
+		func: () => {
+			const mathJax = (window as Window & { MathJax?: any }).MathJax;
+			const raw =
+				mathJax?.config?.tex?.macros
+				|| mathJax?.tex?.macros
+				|| mathJax?.config?.TeX?.Macros
+				|| {};
+
+			if (!raw || typeof raw !== 'object') return {};
+
+			const macros: Record<string, string | [string, number]> = {};
+			for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+				if (typeof value === 'string') {
+					macros[name] = value;
+					continue;
+				}
+
+				if (Array.isArray(value) && typeof value[0] === 'string') {
+					const argc = typeof value[1] === 'number' ? value[1] : Number(value[1]);
+					macros[name] = Number.isFinite(argc) ? [value[0], argc] : value[0];
+				}
+			}
+
+			return macros;
+		},
+	});
+
+	return sanitizeMathJaxMacros(injection?.result);
+}
+
+async function injectMathJaxIntoTab(tabId: number, config: MathJaxConfig): Promise<void> {
+	if (typeof chrome === 'undefined' || !chrome.scripting?.executeScript || !chrome.runtime?.getURL) {
+		throw new Error('MathJax injection is not available in this browser context');
+	}
+
+	// Check if MathJax is already initialized before overwriting.
+	// If it has typesetPromise, merge our config (macros) into it.
+	// Otherwise set a fresh config and load the bundled script.
+	const [hasMathJax] = await chrome.scripting.executeScript({
+		target: { tabId },
+		world: 'MAIN',
+		func: (cfg: MathJaxConfig) => {
+			const scope = globalThis as typeof globalThis & {
+				MathJax?: MathJaxConfig & {
+					typesetPromise?: (elements?: Element[]) => Promise<unknown>;
+					config?: { tex?: { macros?: Record<string, unknown> } };
+				};
+			};
+			if (scope.MathJax?.typesetPromise) {
+				// Merge macros into existing instance
+				const texCfg = (cfg as Record<string, any>)?.tex;
+				if (texCfg?.macros && scope.MathJax.config?.tex) {
+					scope.MathJax.config.tex.macros = Object.assign(
+						scope.MathJax.config.tex.macros || {}, texCfg.macros
+					);
+				}
+				return true;
+			}
+			scope.MathJax = cfg;
+			return false;
+		},
+		args: [config],
+	});
+
+	if (!hasMathJax?.result) {
+		await chrome.scripting.executeScript({
+			target: { tabId },
+			world: 'MAIN',
+			files: ['mathjax-tex-svg.js'],
+		});
+	}
+
+	const [typesetResult] = await chrome.scripting.executeScript({
+		target: { tabId },
+		world: 'MAIN',
+		func: () => {
+			const scope = globalThis as typeof globalThis & {
+				MathJax?: {
+					startup?: { promise?: Promise<unknown> };
+					typesetPromise?: (elements?: Element[]) => Promise<unknown>;
+					texReset?: () => void;
+					typesetClear?: (elements?: Element[]) => void;
+				};
+			};
+			const article = document.querySelector('article');
+			if (!article) {
+				throw new Error('No article element found for MathJax typesetting');
+			}
+			const mathJax = scope.MathJax;
+			if (!mathJax?.typesetPromise) {
+				throw new Error('MathJax did not initialize in the extension world');
+			}
+			const beforeText = article.textContent || '';
+			return Promise.resolve(mathJax.startup?.promise).then(() => {
+				mathJax.texReset?.();
+				mathJax.typesetClear?.([article]);
+				return mathJax.typesetPromise?.([article]);
+			}).then(() => ({
+				beforeHasInline: beforeText.includes('\\('),
+				beforeHasDisplay: beforeText.includes('\\['),
+				mjxCount: article.querySelectorAll('mjx-container').length,
+			}));
+			},
+		});
+	void typesetResult;
+}
 
 function openHighlightSSE(session: HighlightSSESession): void {
 	if (session.closed || !EVENT_SOURCE_AVAILABLE) return;
@@ -246,6 +383,16 @@ browser.runtime.onMessage.addListener((request: unknown, sender: browser.Runtime
 	if (typeof request === 'object' && request !== null) {
 		const typedRequest = request as { action: string; isActive?: boolean; hasHighlights?: boolean; tabId?: number; text?: string; section?: string };
 		
+		if (typedRequest.action === 'saveReaderSettings') {
+			const { settings } = typedRequest as any;
+			browser.storage.sync.set({ reader_settings: settings }).then(() => {
+				sendResponse({ success: true });
+			}).catch((e: Error) => {
+				sendResponse({ success: false, error: e.message });
+			});
+			return true;
+		}
+
 		if (typedRequest.action === 'pluginFetch') {
 			const { url, method, body, timeoutMs } = typedRequest as any;
 			const controller = new AbortController();
@@ -327,6 +474,40 @@ browser.runtime.onMessage.addListener((request: unknown, sender: browser.Runtime
 					sendResponse({success: false, error: 'No active tab found'});
 				}
 			});
+			return true;
+		}
+
+		if (typedRequest.action === 'injectMathJax') {
+			const tabId = typedRequest.tabId || sender.tab?.id;
+			const { config } = typedRequest as { config?: MathJaxConfig };
+			if (!tabId) { sendResponse({ success: false }); return true; }
+
+			(async () => {
+				try {
+					await injectMathJaxIntoTab(tabId, config || {});
+					sendResponse({ success: true });
+				} catch (e) {
+					console.error('[Obsidian Clipper] injectMathJax failed', e);
+					sendResponse({ success: false, error: (e as Error).message });
+				}
+			})();
+			return true;
+		}
+
+		if (typedRequest.action === 'getMathJaxMacros') {
+			const tabId = typedRequest.tabId || sender.tab?.id;
+			if (!tabId) {
+				sendResponse({ success: false, macros: {}, error: 'No tab ID provided' });
+				return true;
+			}
+
+			extractMathJaxMacrosFromTab(tabId)
+				.then((macros) => sendResponse({ success: true, macros }))
+				.catch((error) => sendResponse({
+					success: false,
+					macros: {},
+					error: error instanceof Error ? error.message : String(error),
+				}));
 			return true;
 		}
 

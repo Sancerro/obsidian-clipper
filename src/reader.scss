@@ -167,7 +167,7 @@
 	-webkit-font-smoothing: antialiased !important;
 
 	::selection {
-		background-color: var(--text-selection);
+		background-color: rgba(255, 220, 50, 0.25);
 	}
 
 	.obsidian-reader-content {
@@ -1520,4 +1520,33 @@
 	.hljs-strong {
 		font-weight: bold;
 	}
+
+	// KaTeX errors (unsupported environments like prooftree) — hide the red
+	.katex-error {
+		color: var(--text-muted) !important;
+		font-size: 0.85em;
+		font-family: var(--font-monospace);
+	}
+
+	// Coqdoc syntax highlighting (Software Foundations, etc.)
+	// Coqdoc uses <span class="id" title="keyword|constructor|...">.
+	.id[title="keyword"] { color: var(--color-cyan); }
+	.id[title="tactic"] { color: var(--color-cyan); }
+	.id[title="constructor"] { color: var(--color-green); }
+	.id[title="var"],
+	.id[title="variable"],
+	.id[title="binder"] { color: var(--color-purple); }
+	.id[title="definition"],
+	.id[title="lemma"],
+	.id[title="abbreviation"],
+	.id[title="instance"],
+	.id[title="projection"],
+	.id[title="method"],
+	.id[title="axiom"] { color: var(--color-blue); }
+	.id[title="inductive"],
+	.id[title="record"],
+	.id[title="class"] { color: var(--color-yellow); }
+	.id[title="notation"] { color: var(--color-orange); }
+	.id[title="module"],
+	.id[title="library"] { color: var(--color-pink); }
 }

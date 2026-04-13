@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Lambda Calculus Basics</title>
+</head>
+<body>
+<div id="content">
+<h1>The Lambda Calculus</h1>
+<p><em>First published Wed Dec 12, 2012</em></p>
+
+<p>The <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\lambda">\lambda</math>-calculus is, at heart, a simple notation for functions and application.</p>
+
+<p>To take a mathematical example, suppose we are given a simple polynomial such as <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="x^2 -2\cdot x+5">x^2 -2\cdot x+5</math>.</p>
+
+<p>The central operation is function application:</p>
+
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block" data-latex="\begin{align} (\lambda x[x^2 -2\cdot x+5])2 \rhd 2^2&amp; -2\cdot 2+5 \\ &amp;= 4-4+5 \\ &amp;= 5 \end{align}">
+\begin{align} (\lambda x[x^2 -2\cdot x+5])2 \rhd 2^2 -2\cdot 2+5 \\ = 4-4+5 \\ = 5 \end{align}
+</math>
+
+<h2>1. Introduction</h2>
+
+<p>The syntax of basic <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\lambda">\lambda</math>-calculus is quite sparse.</p>
+
+<p><strong>Definition</strong> The syntactic functions <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\mathbf{FV}">FV</math> and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\mathbf{BV}">BV</math> (for free variable and bound variable) are defined recursively as follows:</p>
+
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block" data-latex="\mathbf{FV}(x) = \{x\}">FV(x) = {x}</math>
+
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block" data-latex="\mathbf{FV}(\lambda x.M) = \mathbf{FV}(M) \setminus \{x\}">FV(λx.M) = FV(M) \ {x}</math>
+
+<p>The <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\beta">\beta</math>-reduction rule and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\alpha">\alpha</math>-conversion are the core computation rules.</p>
+
+<h2>2. Syntax</h2>
+
+<p>The set of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\lambda">\lambda</math>-terms is built from variables using abstraction <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="\lambda x.M">\lambda x.M</math> and application <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline" data-latex="(MN)">(MN)</math>.</p>
+</div>
+</body>
+</html>

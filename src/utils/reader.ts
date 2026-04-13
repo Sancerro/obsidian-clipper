@@ -14,6 +14,8 @@ import { getFontCss } from './font-utils';
 import { logHandledError } from './error-utils';
 import { wireTranscript } from './reader-transcript';
 
+type MathJaxMacroMap = Record<string, string | [string, number]>;
+
 function showPluginStatusToast(connected: boolean): void {
 	const existing = document.getElementById('obsidian-plugin-toast');
 	if (existing) existing.remove();
@@ -116,6 +118,84 @@ export class Reader {
 		
 		return svg;
 	}
+
+	private static sanitizeMathJaxMacros(raw: unknown): MathJaxMacroMap {
+		const sanitized: MathJaxMacroMap = {};
+		if (!raw || typeof raw !== 'object') return sanitized;
+
+		for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+			if (typeof value === 'string') {
+				sanitized[name] = value;
+				continue;
+			}
+
+			if (Array.isArray(value) && typeof value[0] === 'string') {
+				const argc = typeof value[1] === 'number' ? value[1] : Number(value[1]);
+				sanitized[name] = Number.isFinite(argc) ? [value[0], argc] : value[0];
+			}
+		}
+
+		return sanitized;
+	}
+
+	private static getMathJaxMacros(doc: Document): MathJaxMacroMap {
+		const raw = doc.documentElement.getAttribute('data-math-macros');
+		if (!raw) return {};
+
+		try {
+			const parsed = this.sanitizeMathJaxMacros(JSON.parse(raw));
+			const normalized: MathJaxMacroMap = {};
+			for (const [name, value] of Object.entries(parsed)) {
+				normalized[name.startsWith('\\') ? name : `\\${name}`] = value;
+			}
+			return normalized;
+		} catch {
+			return {};
+		}
+	}
+
+	private static getKatexMathJaxMacros(doc: Document): Record<string, string> {
+		const macros: Record<string, string> = {};
+		for (const [name, value] of Object.entries(this.getMathJaxMacros(doc))) {
+			macros[name] = Array.isArray(value) ? value[0] : value;
+		}
+		return macros;
+	}
+
+	private static async storeMathJaxMacros(doc: Document): Promise<void> {
+		try {
+			const response = await browser.runtime.sendMessage({ action: 'getMathJaxMacros' }) as { macros?: unknown } | undefined;
+			const macros = this.sanitizeMathJaxMacros(response?.macros);
+			if (Object.keys(macros).length > 0) {
+				doc.documentElement.setAttribute('data-math-macros', JSON.stringify(macros));
+			} else {
+				doc.documentElement.removeAttribute('data-math-macros');
+			}
+		} catch {
+			doc.documentElement.removeAttribute('data-math-macros');
+		}
+	}
+
+	private static async createMathJax3ExtractionDoc(doc: Document): Promise<Document | null> {
+		try {
+			const rawResp = await fetch(doc.URL);
+			if (!rawResp.ok) return null;
+
+			const rawHtml = await rawResp.text();
+			const rawDoc = new DOMParser().parseFromString(rawHtml, 'text/html');
+			Object.defineProperty(rawDoc, 'URL', { value: doc.URL, configurable: true });
+
+			const macroAttr = doc.documentElement.getAttribute('data-math-macros');
+			if (macroAttr) {
+				rawDoc.documentElement.setAttribute('data-math-macros', macroAttr);
+			}
+
+			return rawDoc;
+		} catch {
+			return null;
+		}
+	}
+
 	private static settingsBar: HTMLElement | null = null;
 	private static colorSchemeMediaQuery: MediaQueryList | null = null;
 	private static readerStyles: HTMLLinkElement | null = null;
@@ -151,7 +231,15 @@ export class Reader {
 	}
 
 	private static async saveSettings(): Promise<void> {
-		await browser.storage.sync.set({ reader_settings: this.settings });
+		const snapshot = { ...this.settings };
+		// Route through background script — storage.sync.set from content scripts
+		// injected via chrome.scripting.executeScript can silently fail.
+		try {
+			await browser.runtime.sendMessage({ action: 'saveReaderSettings', settings: snapshot });
+		} catch {
+			// Fallback to direct write (e.g. if background is unavailable)
+			await browser.storage.sync.set({ reader_settings: snapshot });
+		}
 	}
 
 	private static injectSettingsBar(doc: Document) {
@@ -180,29 +268,6 @@ export class Reader {
 				settingsBar.classList.remove('is-open');
 			}
 		});
-
-		// Highlighter button
-		const highlighterBtn = doc.createElement('button');
-		highlighterBtn.className = 'obsidian-reader-settings-trigger nav-btn';
-		highlighterBtn.setAttribute('aria-label', getMessage('highlighter'));
-		highlighterBtn.appendChild(this.createSVG({
-			width: '18', height: '18', viewBox: '0 0 24 24', strokeWidth: '1.75',
-			paths: ['m9 11-6 6v3h9l3-3', 'm22 12-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4'],
-		}));
-		highlighterBtn.addEventListener('click', async () => {
-			clipDropdown.classList.remove('is-open');
-			settingsBar.classList.remove('is-open');
-			const response = await browser.runtime.sendMessage({ action: 'getActiveTab' }) as { tabId?: number };
-			if (response.tabId) {
-				await browser.runtime.sendMessage({ action: 'toggleHighlighterMode', tabId: response.tabId });
-				highlighterBtn.classList.toggle('is-active');
-			}
-		});
-
-		// Sync active state with highlighter mode
-		if (doc.body.classList.contains('obsidian-highlighter-active')) {
-			highlighterBtn.classList.add('is-active');
-		}
 
 		// Clip button with dropdown
 		const clipButton = doc.createElement('button');
@@ -270,7 +335,6 @@ export class Reader {
 
 		const triggerGroup = doc.createElement('div');
 		triggerGroup.className = 'obsidian-reader-nav';
-		triggerGroup.appendChild(highlighterBtn);
 		triggerGroup.appendChild(clipButton);
 		triggerGroup.appendChild(trigger);
 		settingsBar.appendChild(triggerGroup);
@@ -450,6 +514,7 @@ export class Reader {
 
 		const themeModeSelect = doc.createElement('select');
 		themeModeSelect.className = 'obsidian-reader-settings-select';
+		themeModeSelect.dataset.settingId = 'reader-appearance';
 
 		const modeOptions: Array<[string, string]> = [
 			['auto', 'readerAppearanceAuto'],
@@ -752,7 +817,7 @@ export class Reader {
 		const pageModified = this.extractPageModifiedDate(doc);
 
 		try {
-			const normalizedUrl = doc.URL.replace(/#:~:text=[^&]+(&|$)/, '');
+			const normalizedUrl = doc.URL.replace(/#.*$/, '');
 			// 2s timeout: if plugin is slow/offline, fall through to Defuddle quickly
 			const timeout = new Promise<never>((_, reject) =>
 				setTimeout(() => reject(new Error('timeout')), 2000)
@@ -786,27 +851,26 @@ export class Reader {
 			showPluginStatusToast(false);
 		}
 
-		// Work around Defuddle's "-comment" partial-selector false positive.
-		// Defuddle's PARTIAL_SELECTORS list (node_modules/defuddle/dist/constants.js)
-		// includes the substring "-comment" to strip comment sections. Wikipedia
-		// wraps phonetic pronunciation tooltips in `<span class="rt-commentedText">`
-		// ("rt" = ruby text / annotation), and "-comment" matches that class,
-		// causing the whole wrapper — including the IPA transcription inside —
-		// to get removed. Example: /əˈpɒkrɪfə/ on en.wikipedia.org/wiki/Apocrypha
-		// disappears in reader mode. Stripping just the offending class on the
-		// source doc before Defuddle runs preserves the inner structure without
-		// touching any other extraction logic. Doing this only here (reader mode)
-		// is enough because auto-clip later reads from the already-extracted
-		// `<article>` element and inherits the fix.
-		doc.querySelectorAll('.rt-commentedText').forEach(el => {
-			el.classList.remove('rt-commentedText');
+		// Coqdoc inline code: convert <span class="inlinecode"> to <code>
+		// so Defuddle recognizes them as inline code elements.
+		doc.querySelectorAll('span.inlinecode').forEach(el => {
+			const code = doc.createElement('code');
+			code.innerHTML = el.innerHTML;
+			el.replaceWith(code);
 		});
+
+		// MathJax cleanup already done in apply() before cleanupScripts.
 
 		const defuddle = new Defuddle(doc, { url: doc.URL });
 		const defuddled = await defuddle.parseAsync();
 
+		// Defuddle's wrapRawLatexDelimiters() handles \[...\] and \(...\) at the
+		// DOM level, wrapping them in <math data-latex="..."> elements. These are
+		// converted back to delimiters by renderMath() for MathJax typesetting.
+		let content = defuddled.content;
+
 		return {
-			content: defuddled.content,
+			content,
 			title: defuddled.title,
 			author: defuddled.author,
 			published: defuddled.published,
@@ -872,7 +936,33 @@ export class Reader {
 		// Convert article HTML to markdown — uses the createMarkdownContent
 		// re-exported from reader-highlights.ts (already statically imported).
 		const { createMarkdownContent } = await import('defuddle/full');
-		const markdown = createMarkdownContent(article.innerHTML, url);
+		// Use pre-KaTeX HTML if available — it has code[data-math-latex] placeholders
+		// that the mathPlaceholder turndown rule converts to $...$. The live article
+		// innerHTML has rendered KaTeX spans which turndown can't convert back.
+		// The pre-MathJax HTML has raw \(...\) and \[...\] delimiters.
+		// Parse as DOM and wrap them in <math data-latex> elements so
+		// createMarkdownContent's turndown rules convert them to $...$.
+		const rawHtml = article.getAttribute('data-pre-mathjax-html') || article.innerHTML;
+		const tempDoc = new DOMParser().parseFromString(`<article>${rawHtml}</article>`, 'text/html');
+		const tempArticle = tempDoc.querySelector('article');
+		if (tempArticle) {
+			const { wrapRawLatexDelimiters } = await import('defuddle/full');
+			wrapRawLatexDelimiters(tempArticle, tempDoc);
+		}
+		const articleHtml = tempArticle?.innerHTML || rawHtml;
+		let markdown = createMarkdownContent(articleHtml, url);
+
+		// Prepend \newcommand definitions for page-specific macros so
+		// Obsidian's MathJax can resolve them when rendering the note.
+		const macroDefs = Object.entries(this.getMathJaxMacros(doc)).map(([name, val]) => {
+			if (Array.isArray(val)) {
+				return `\\newcommand{${name}}[${val[1]}]{${val[0]}}`;
+			}
+			return `\\newcommand{${name}}{${val}}`;
+		}).join('\n');
+		if (macroDefs) {
+			markdown = `$$\n${macroDefs}\n$$\n\n${markdown}`;
+		}
 		// Note: this dynamic import is fine in reader.ts because reader-script.js
 		// loads via chrome.scripting.executeScript (not content_scripts), so
 		// webpack chunk loading works. reader-highlights.ts can't use dynamic
@@ -1949,6 +2039,70 @@ export class Reader {
 
 			// Flatten shadow DOM content before cleanup removes scripts
 			await flattenShadowDomUtil(doc);
+			let extractionDocOverride: Document | null = null;
+
+			// Extract MathJax macros from the MAIN world via the background script.
+			await this.storeMathJaxMacros(doc);
+
+			// MathJax cleanup BEFORE cleanupScripts removes all <script> tags.
+			//
+			// MathJax 2: <span class="MathJax_CHTML"> + <script type="math/tex">
+			// MathJax 3: <mjx-container> (no script, no data-latex — LaTeX is gone)
+			//
+			// Strategy: MathJax 2 → extract from <script type="math/tex">.
+			// MathJax 3 → re-fetch the raw source HTML and extract \(...\) / \[...\].
+			// Extract LaTeX from KaTeX-rendered elements before cleanup
+			doc.querySelectorAll('.katex').forEach(el => {
+				// Skip KaTeX inside code/pre blocks (e.g. documentation examples)
+				if (el.closest('pre, code')) return;
+				const annotation = el.querySelector('annotation[encoding="application/x-tex"]');
+				const latex = (annotation?.textContent || '').trim();
+				if (!latex) return;
+				const isDisplay = el.closest('.katex-display') !== null;
+				const placeholder = doc.createElement('code');
+				placeholder.setAttribute('data-math-latex', latex);
+				placeholder.setAttribute('data-math-display', isDisplay ? 'block' : 'inline');
+				placeholder.textContent = latex;
+				el.replaceWith(placeholder);
+			});
+
+			const hasMathJax2Scripts = doc.querySelector('script[type="math/tex"]');
+			const hasMathJax3 = doc.querySelector('mjx-container');
+
+			if (hasMathJax2Scripts) {
+				doc.querySelectorAll('script[type="math/tex"], script[type="math/tex; mode=display"]').forEach(el => {
+					const latex = (el.textContent || '').trim();
+					if (!latex) return;
+					const isDisplay = (el.getAttribute('type') || '').includes('display');
+					const placeholder = doc.createElement('code');
+					placeholder.setAttribute('data-math-latex', latex);
+					placeholder.setAttribute('data-math-display', isDisplay ? 'block' : 'inline');
+					placeholder.textContent = latex;
+					el.replaceWith(placeholder);
+				});
+			}
+
+			if (hasMathJax3) {
+				// MathJax 3 destroys the original LaTeX in the live DOM. Re-fetch the
+				// raw source and use that document for extraction so cleanupScripts()
+				// and later cloning do not discard the original delimiters.
+				extractionDocOverride = await this.createMathJax3ExtractionDoc(doc);
+			}
+
+			doc.querySelectorAll('.MathJax_CHTML, .MathJax_SVG, .MathJax, .MathJax_Preview, mjx-container').forEach(el => el.remove());
+
+			// Preserve LaTeX from MathML elements with data-latex before removing them
+			doc.querySelectorAll('math[data-latex]').forEach(el => {
+				const latex = (el.getAttribute('data-latex') || '').trim();
+				if (!latex) { el.remove(); return; }
+				const isDisplay = el.getAttribute('display') === 'block';
+				const placeholder = doc.createElement('code');
+				placeholder.setAttribute('data-math-latex', latex);
+				placeholder.setAttribute('data-math-display', isDisplay ? 'block' : 'inline');
+				placeholder.textContent = latex;
+				el.replaceWith(placeholder);
+			});
+			doc.querySelectorAll('math').forEach(el => el.remove());
 
 			// Remove page scripts and their effects
 			this.cleanupScripts(doc);
@@ -1957,20 +2111,24 @@ export class Reader {
 			while (doc.body.attributes.length > 0) {
 				doc.body.removeAttribute(doc.body.attributes[0].name);
 			}
-			
+
 			// Clean the html element but preserve lang and dir attributes
 			const htmlElement = doc.documentElement;
 			const lang = htmlElement.getAttribute('lang');
 			const dir = htmlElement.getAttribute('dir');
-			
+
 			// Restore lang and dir if they existed
 			if (lang) htmlElement.setAttribute('lang', lang);
 			if (dir) htmlElement.setAttribute('dir', dir);
-			
+
 			// Clone document for Defuddle before we clear the body
-			const docClone = doc.cloneNode(true) as Document;
+			const docClone = extractionDocOverride ?? (doc.cloneNode(true) as Document);
 			// Preserve the URL for Defuddle's extractors
 			Object.defineProperty(docClone, 'URL', { value: doc.URL, configurable: true });
+			const macroAttr = doc.documentElement.getAttribute('data-math-macros');
+			if (macroAttr && !docClone.documentElement.getAttribute('data-math-macros')) {
+				docClone.documentElement.setAttribute('data-math-macros', macroAttr);
+			}
 			// Start content extraction on the clone (don't await yet)
 			const contentPromise = this.extractContent(docClone);
 
@@ -2102,7 +2260,7 @@ export class Reader {
 				doc.body.appendChild(clipperIframeContainer);
 			}
 
-			// Toggle dark mode with D key (visual only, doesn't change appearance setting)
+			// Toggle dark mode with D key (persists across sessions)
 			doc.addEventListener('keydown', (e) => {
 				if (!this.isActive) return;
 				if (e.ctrlKey || e.metaKey) return;
@@ -2110,10 +2268,12 @@ export class Reader {
 				if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
 				if (e.key === 'd' || e.key === 'D') {
-					const html = doc.documentElement;
-					const isDark = html.classList.contains('theme-dark');
-					html.classList.remove('theme-light', 'theme-dark');
-					html.classList.add(isDark ? 'theme-light' : 'theme-dark');
+					const isDark = doc.documentElement.classList.contains('theme-dark');
+					const newMode = isDark ? 'light' : 'dark';
+					this.updateThemeMode(doc, newMode);
+					// Sync the settings bar dropdown
+					const modeSelect = doc.querySelector('select[data-setting-id="reader-appearance"]') as HTMLSelectElement | null;
+					if (modeSelect) modeSelect.value = newMode;
 				}
 
 				if (e.key === 'c' || e.key === 'C') {
@@ -2295,6 +2455,25 @@ export class Reader {
 				}
 			}
 
+			// Store original Defuddle HTML (with <math data-latex> elements)
+			// before converting to placeholders — quickSaveToObsidian needs these.
+			article.setAttribute('data-pre-mathjax-html', contentBody.innerHTML);
+
+			contentBody.querySelectorAll('math[data-latex]').forEach(el => {
+				const latex = el.getAttribute('data-latex');
+				if (!latex) return;
+
+				const placeholder = contentDoc.createElement('span');
+				placeholder.className = 'math-placeholder';
+				placeholder.setAttribute('data-latex', latex);
+
+				if (el.getAttribute('display') === 'block') {
+					placeholder.setAttribute('data-display', 'block');
+				}
+
+				el.replaceWith(placeholder);
+			});
+
 			while (contentBody.firstChild) {
 				article.appendChild(contentBody.firstChild);
 			}
@@ -2351,20 +2530,17 @@ export class Reader {
 			footer.style.display = '';
 
 			// Initialize content-dependent features
-			this.initializeContentFeatures(doc, title);
+			await this.initializeContentFeatures(doc, title);
 
 			// Stop page-level sync (reader mode has its own sync)
 			stopPageHighlightSync();
 
 			// Auto-enable highlighter for all reader mode pages
 			toggleHighlighterMenu(true);
-			const highlighterBtn = doc.querySelector('.obsidian-reader-settings-trigger[aria-label]');
-			if (highlighterBtn && highlighterBtn.getAttribute('aria-label') === getMessage('highlighter')) {
-				(highlighterBtn as HTMLElement).style.display = 'none';
-			}
 
 			// Set up the current URL for highlight tracking
-			this.currentNoteUrl = doc.URL.replace(/#:~:text=[^&]+(&|$)/, '');
+			// Strip all hash fragments — same page, same highlights regardless of anchor.
+			this.currentNoteUrl = doc.URL.replace(/#.*$/, '');
 
 			if (extractorType === 'obsidian-note' && notePath) {
 				if (!this.pluginStatusShown) {
@@ -2394,7 +2570,7 @@ export class Reader {
 
 	// ── Content feature initialization (shared between apply and refresh) ──
 
-	private static initializeContentFeatures(doc: Document, title?: string): void {
+	private static async initializeContentFeatures(doc: Document, title?: string): Promise<void> {
 		this.observer = this.generateOutline(doc, title);
 		this.initializeFootnotes(doc);
 		this.initializeCodeHighlighting(doc);
@@ -2402,6 +2578,192 @@ export class Reader {
 		this.initializeLightbox(doc);
 		this.linkifyTextUrls(doc);
 		this.initializeComments(doc);
+		await this.renderMath(doc);
+	}
+
+	private static latexToReaderText(latex: string): string {
+		const subscripts: Record<string, string> = {
+			'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+			'5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+		};
+		const superscripts: Record<string, string> = {
+			'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+			'5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+		};
+
+		let text = latex
+			.replace(/\\lambda\b/g, 'λ')
+			.replace(/\\(?:to|rightarrow)\b/g, '→')
+			.replace(/\\Rightarrow\b/g, '⇒')
+			.replace(/\\wedge\b/g, '∧')
+			.replace(/\\vee\b/g, '∨')
+			.replace(/\\neg\b/g, '¬')
+			.replace(/\\supset\b/g, '⊃')
+			.replace(/\\bot\b/g, '⊥')
+			.replace(/\\top\b/g, '⊤')
+			.replace(/\\langle\b/g, '⟨')
+			.replace(/\\rangle\b/g, '⟩')
+			.replace(/\\vdots\b/g, '⋮')
+			.replace(/\\cdot\b/g, '·')
+			.replace(/\\text\{([^}]*)\}/g, '$1')
+			.replace(/\\mathrm\{([^}]*)\}/g, '$1')
+			.replace(/\\mathit\{([^}]*)\}/g, '$1')
+			.replace(/\\cal([A-Za-z])/g, '$1')
+			.replace(/\\[a-zA-Z]+\b/g, (match) => match.slice(1))
+			.replace(/_\{(\d+)\}/g, (_match, digits) => digits.split('').map((digit: string) => subscripts[digit] || digit).join(''))
+			.replace(/\^(\d+)/g, (_match, digits) => digits.split('').map((digit: string) => superscripts[digit] || digit).join(''))
+			.replace(/[{}]/g, '')
+			.replace(/\s+/g, ' ')
+			.trim();
+
+		if (!text) text = latex.trim();
+		return text;
+	}
+
+	private static fallbackRenderMath(article: HTMLElement, doc: Document): number {
+		const walker = doc.createTreeWalker(article, NodeFilter.SHOW_TEXT);
+		const textNodes: Text[] = [];
+		let node: Node | null;
+		while ((node = walker.nextNode())) {
+			if (node.parentElement?.closest('mjx-container')) continue;
+			textNodes.push(node as Text);
+		}
+
+		let renderedCount = 0;
+		const pattern = /\\\[((?:\\.|[\s\S])*?)\\\]|\\\(((?:\\.|[\s\S])*?)\\\)/g;
+
+		for (const textNode of textNodes) {
+			const source = textNode.data;
+			pattern.lastIndex = 0;
+			if (!pattern.test(source)) continue;
+			pattern.lastIndex = 0;
+
+			const fragment = doc.createDocumentFragment();
+			let lastIndex = 0;
+			let match: RegExpExecArray | null;
+
+			while ((match = pattern.exec(source))) {
+				const [fullMatch, displayLatex, inlineLatex] = match;
+				const latex = displayLatex ?? inlineLatex ?? '';
+				const isDisplay = displayLatex !== undefined;
+
+				if (match.index > lastIndex) {
+					fragment.appendChild(doc.createTextNode(source.slice(lastIndex, match.index)));
+				}
+
+				const container = doc.createElement('mjx-container');
+				container.setAttribute('jax', 'CHTML');
+				if (isDisplay) {
+					container.setAttribute('display', 'true');
+					container.style.display = 'block';
+					container.style.margin = '1em 0';
+				} else {
+					container.style.display = 'inline-block';
+				}
+				container.textContent = this.latexToReaderText(latex);
+				fragment.appendChild(container);
+				renderedCount += 1;
+				lastIndex = match.index + fullMatch.length;
+			}
+
+			if (lastIndex < source.length) {
+				fragment.appendChild(doc.createTextNode(source.slice(lastIndex)));
+			}
+
+			textNode.replaceWith(fragment);
+		}
+
+		return renderedCount;
+	}
+
+	private static async renderMath(doc: Document): Promise<void> {
+		const article = doc.querySelector('article');
+		if (!article) return;
+
+		// Store pre-render HTML for quickSaveToObsidian. Prefer the original
+		// Defuddle output (has <math data-latex> elements) over current innerHTML
+		// (which may have had <math> converted to .math-placeholder spans).
+		if (!article.hasAttribute('data-pre-mathjax-html')) {
+			article.setAttribute('data-pre-mathjax-html', article.innerHTML);
+		}
+
+		// Convert code[data-math-latex] placeholders back to \(...\) / \[...\]
+		// delimiters so MathJax can process them natively.
+		article.querySelectorAll('code[data-math-latex]').forEach(el => {
+			const latex = el.getAttribute('data-math-latex') || '';
+			const isDisplay = el.getAttribute('data-math-display') === 'block';
+			const text = isDisplay ? `\\[${latex}\\]` : `\\(${latex}\\)`;
+			el.replaceWith(doc.createTextNode(text));
+		});
+		// Also convert .math-placeholder and math[data-latex] elements
+		article.querySelectorAll('.math-placeholder[data-latex], math[data-latex]').forEach(el => {
+			const latex = el.getAttribute('data-latex') || '';
+			const isDisplay = el.getAttribute('display') === 'block' || el.getAttribute('data-display') === 'block';
+			const text = isDisplay ? `\\[${latex}\\]` : `\\(${latex}\\)`;
+			el.replaceWith(doc.createTextNode(text));
+		});
+
+		// Check if there's any math to render
+		const text = article.textContent || '';
+		if (!text.includes('\\(') && !text.includes('\\[')) return;
+
+		// Load page-specific MathJax macros
+		const macroAttr = doc.documentElement.getAttribute('data-math-macros');
+		let macros: Record<string, string | [string, number]> = {};
+		if (macroAttr) {
+			try { macros = JSON.parse(macroAttr); } catch {}
+		}
+
+		// Inject macros as a hidden \newcommand preamble so MathJax processes
+		// them via standard LaTeX semantics (more reliable than configmacros
+		// in combined builds injected into extension pages).
+		// Use visibility:hidden (not display:none) so MathJax still scans it.
+		if (Object.keys(macros).length > 0) {
+			const defs: string[] = [];
+			for (const [name, value] of Object.entries(macros)) {
+				if (Array.isArray(value)) {
+					defs.push(`\\newcommand{\\${name}}[${value[1]}]{${value[0]}}`);
+				} else {
+					defs.push(`\\newcommand{\\${name}}{${value}}`);
+				}
+			}
+			const preamble = doc.createElement('div');
+			preamble.setAttribute('aria-hidden', 'true');
+			preamble.style.cssText = 'visibility:hidden;height:0;overflow:hidden;position:absolute;';
+			preamble.textContent = `\\(${defs.join('')}\\)`;
+			article.prepend(preamble);
+		}
+
+		// Inject MathJax: set config via background script (MAIN world),
+		// then load the script via a <script src> tag (web-accessible resource).
+		const mjConfig = {
+			tex: {
+				inlineMath: [['\\(', '\\)']],
+				displayMath: [['\\[', '\\]']],
+				macros,
+			},
+			svg: { fontCache: 'local' },
+			startup: { typeset: false },
+		};
+
+		// Inject MathJax via the background script and wait for typesetting so
+		// reader mode does not race the page assertions.
+		try {
+			const response = await browser.runtime.sendMessage({
+				action: 'injectMathJax',
+				config: mjConfig,
+			}) as { success?: boolean; error?: string } | undefined;
+			if (response && response.success === false) {
+				console.error('[Obsidian Clipper] MathJax injection failed:', response.error || 'unknown error');
+			}
+		} catch {
+			console.error('[Obsidian Clipper] MathJax injection message failed');
+			// Leave raw delimiters in place if MathJax injection fails.
+		}
+
+		if (!article.querySelector('mjx-container')) {
+			this.fallbackRenderMath(article as HTMLElement, doc);
+		}
 	}
 
 	// ── Obsidian note highlight sync ──────────────────────────────────

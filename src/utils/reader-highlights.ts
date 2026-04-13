@@ -7,7 +7,7 @@ import browser from './browser-polyfill';
 import { getPluginErrorMessage, pluginFetch } from './plugin-url';
 import { logHandledError } from './error-utils';
 import Defuddle from 'defuddle';
-import { createMarkdownContent as defuddleToMarkdown } from 'defuddle/full';
+import { createMarkdownContent as defuddleToMarkdown, wrapRawLatexDelimiters } from 'defuddle/full';
 
 // ── Types ────────────────────────────────────────────────
 
@@ -431,21 +431,35 @@ export async function autoClipPage(url: string): Promise<void> {
 		let markdown: string;
 
 		if (article) {
-			// Reader-mode path: identical to quickSaveToObsidian. Title from <h1>,
-			// markdown straight from article.innerHTML via defuddle/full's
-			// createMarkdownContent, no Defuddle parse.
+			// Reader-mode path: mirrors quickSaveToObsidian. Use pre-MathJax HTML
+			// (has code[data-math-latex] placeholders) and prepend macro definitions.
 			const rawTitle = document.querySelector('h1')?.textContent?.trim() || document.title || 'Untitled';
 			title = rawTitle;
-			markdown = defuddleToMarkdown(article.innerHTML, cleanUrl);
+			const rawHtml = article.getAttribute('data-pre-mathjax-html') || article.innerHTML;
+			const tempDoc = new DOMParser().parseFromString(`<article>${rawHtml}</article>`, 'text/html');
+			const tempArt = tempDoc.querySelector('article');
+			if (tempArt) wrapRawLatexDelimiters(tempArt, tempDoc);
+			markdown = defuddleToMarkdown(tempArt?.innerHTML || rawHtml, cleanUrl);
+
+			// Prepend \newcommand definitions for page-specific macros
+			const macroAttr = document.documentElement.getAttribute('data-math-macros');
+			if (macroAttr) {
+				try {
+					const macros = JSON.parse(macroAttr) as Record<string, string | [string, number]>;
+					const defs = Object.entries(macros).map(([name, val]) => {
+						const n = name.startsWith('\\') ? name : `\\${name}`;
+						if (Array.isArray(val)) return `\\newcommand{${n}}[${val[1]}]{${val[0]}}`;
+						return `\\newcommand{${n}}{${val}}`;
+					}).join('\n');
+					if (defs) markdown = `$$\n${defs}\n$$\n\n${markdown}`;
+				} catch {}
+			}
 		} else {
 			// Non-reader fallback: run Defuddle directly (we're already in the
 			// content script context). Using runtime.sendMessage won't work —
 			// it goes to the background script which has no handler for
 			// extractPageMarkdown. Static imports are used instead of dynamic
 			// to avoid code-split chunks that content scripts can't load.
-			document.querySelectorAll('.rt-commentedText').forEach(el =>
-				el.classList.remove('rt-commentedText')
-			);
 			const defuddle = new Defuddle(document, { url: document.URL });
 			let timerId: ReturnType<typeof setTimeout>;
 			const parseTimeout = new Promise<never>((_, reject) => {
@@ -643,6 +657,25 @@ function expandRangeToWordBoundaries(range: Range): void {
 		while (offset > 0 && /\s/.test(text[offset - 1])) offset--;
 		while (offset < text.length && !/\s/.test(text[offset])) offset++;
 		range.setEnd(endNode, offset);
+
+		// If we hit the end of this text node, check if the next sibling
+		// text node starts with sentence-ending punctuation (e.g. the period
+		// is outside a <span>: "<span>sunday</span>.").
+		if (offset === text.length) {
+			let next: Node | null = endNode.nextSibling;
+			// Skip empty text nodes and inline elements to find punctuation
+			while (next && next.nodeType === Node.ELEMENT_NODE && INLINE_TAGS.has((next as Element).tagName)) {
+				next = next.firstChild;
+			}
+			if (next && next.nodeType === Node.TEXT_NODE) {
+				const nextText = next.textContent || '';
+				let puncEnd = 0;
+				while (puncEnd < nextText.length && /[.!?;:,)}\]'"""''–—]/.test(nextText[puncEnd])) puncEnd++;
+				if (puncEnd > 0) {
+					range.setEnd(next, puncEnd);
+				}
+			}
+		}
 	}
 }
 
@@ -1025,7 +1058,10 @@ let spaNavListenersInstalled = false;
 let lastSyncedPath = '';
 
 function normalizeUrl(): string {
-	return window.location.href.replace(/#:~:text=[^&]+(&|$)/, '');
+	// Strip all hash fragments — same page, same document, same highlights.
+	// Previously only stripped #:~:text= fragments, but anchors like #monday
+	// caused highlights to be stored under different keys for the same page.
+	return window.location.href.replace(/#.*$/, '');
 }
 
 function stripHash(url: string): string {

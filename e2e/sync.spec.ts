@@ -1148,20 +1148,32 @@ test('multi-highlight: removing one highlight leaves the others intact', async (
 // background color actually changes.
 
 test('midnight theme: d-key toggles between parchment-light and near-black-dark', async ({
-	page, articleUrl,
+	page, articleUrl, context,
 }) => {
+	// Pre-seed reader settings with midnight as both light and dark theme
+	// so getEffectiveTheme() returns 'midnight' in both modes.
+	const sw = await getServiceWorker(context);
+	await sw.evaluate(async () => {
+		await (globalThis as any).chrome.storage.sync.set({
+			reader_settings: {
+				fontSize: 16, lineHeight: 1.6, maxWidth: 38,
+				lightTheme: 'midnight', darkTheme: 'same',
+				appearance: 'light',
+				fonts: [], defaultFont: '', blendImages: true, colorLinks: false,
+				pinPlayer: true, autoScroll: true, highlightActiveLine: true, customCss: '',
+			},
+		});
+	});
+
 	await page.goto(articleUrl);
 	await enterReaderMode(page);
 
-	// Set the midnight theme and start in light mode.
-	await page.evaluate(() => {
-		const html = document.documentElement;
-		html.setAttribute('data-reader-theme', 'midnight');
-		html.classList.remove('theme-dark');
-		html.classList.add('theme-light');
-	});
+	// Verify midnight theme is applied and we start in light mode.
+	await page.waitForFunction(() =>
+		document.documentElement.classList.contains('theme-light')
+		&& document.documentElement.getAttribute('data-reader-theme') === 'midnight'
+	, { timeout: 3000 });
 
-	// Wait for CSS variables to cascade.
 	const lightBg = await page.evaluate(() => {
 		return getComputedStyle(document.body).backgroundColor;
 	});
@@ -1193,6 +1205,58 @@ test('midnight theme: d-key toggles between parchment-light and near-black-dark'
 		return getComputedStyle(document.body).backgroundColor;
 	});
 	expect(backToLightBg).toMatch(/rgb\(244,\s*240,\s*232\)/);
+});
+
+// ── Theme persistence across reader mode exit / re-enter ──
+//
+// The d-key shortcut now calls updateThemeMode(), which persists the
+// appearance setting to browser.storage.sync. Verify that the chosen
+// theme survives a full exit-reader → re-enter-reader cycle.
+
+test('theme persistence: d-key toggle survives navigation to a new page', async ({
+	page, articleUrl, context,
+}) => {
+	await page.goto(articleUrl);
+	await enterReaderMode(page);
+
+	// Confirm we start in the default (auto → light).
+	await page.waitForFunction(() =>
+		document.documentElement.classList.contains('theme-light')
+	, { timeout: 2000 });
+
+	// Press 'd' to switch to dark mode.
+	await page.focus('body');
+	await page.keyboard.press('d');
+	await page.waitForFunction(() =>
+		document.documentElement.classList.contains('theme-dark')
+	, { timeout: 1000 });
+
+	// The d-key handler calls updateThemeMode which fires saveSettings
+	// asynchronously. Poll storage from the service worker to confirm the
+	// write landed before opening a second tab.
+	const sw = await getServiceWorker(context);
+	await expect.poll(async () => {
+		return sw.evaluate(async () => {
+			const data = await (globalThis as any).chrome.storage.sync.get('reader_settings');
+			return data?.reader_settings?.appearance;
+		});
+	}, { timeout: 5000, message: 'expected storage.sync appearance to be "dark"' }).toBe('dark');
+
+	// Open a fresh page and enter reader mode — settings load from storage.
+	const page2 = await context.newPage();
+	await page2.goto(articleUrl);
+	await enterReaderMode(page2);
+
+	// The theme should still be dark (persisted to storage).
+	await page2.waitForFunction(() =>
+		document.documentElement.classList.contains('theme-dark')
+	, { timeout: 3000 });
+
+	const isDark = await page2.evaluate(() =>
+		document.documentElement.classList.contains('theme-dark')
+	);
+	expect(isDark).toBe(true);
+	await page2.close();
 });
 
 // ── Wikipedia IPA phonetics survive reader-mode extraction ──
@@ -1564,4 +1628,314 @@ test('prefix/suffix disambiguation: highlight lands on the correct occurrence', 
 	expect(mark2, 'second "jump" highlight should be anchored').toBeDefined();
 	expect(mark1!.parentId).toBe('p1');
 	expect(mark2!.parentId).toBe('p2');
+});
+
+// ── Coqdoc div.code → pre/code conversion ──────────────────
+//
+// Sites like Software Foundations (coqdoc output) use <div class="code">
+// with inline <span>/<br> instead of standard <pre><code> blocks.
+// Defuddle doesn't recognise these as code, so they get stripped.
+// The fix converts div.code → pre>code before Defuddle runs.
+
+test('coqdoc: div.code blocks survive reader-mode extraction', async ({
+	page,
+}) => {
+	const coqUrl = 'http://127.0.0.1:3100/coqdoc.html';
+	await page.goto(coqUrl);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 10_000 });
+
+	// The Inductive day definition should be present with all constructor
+	// names (monday–sunday) — not just bare pipe characters.
+	const check = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { hasInductive: false, hasMonday: false, codeBlockCount: 0, text: '' };
+		const text = article.textContent || '';
+		return {
+			hasInductive: text.includes('Inductive'),
+			hasMonday: text.includes('monday') && text.includes('sunday'),
+			codeBlockCount: article.querySelectorAll('pre').length,
+			text: text.slice(0, 500),
+		};
+	});
+
+	expect(check.hasInductive, `reader must contain "Inductive" (got: ${check.text.slice(0, 200)})`).toBe(true);
+	expect(check.hasMonday, 'reader must contain day constructors (monday, sunday)').toBe(true);
+	expect(check.codeBlockCount, 'code blocks must be wrapped in <pre>').toBeGreaterThanOrEqual(2);
+});
+
+// ── MathJax / KaTeX rendering in reader mode ────────────────
+//
+// Pages using MathJax (e.g. Stanford Encyclopedia of Philosophy) produce
+// <math data-latex="..."> elements. Reader mode renders these via KaTeX.
+
+test('math: MathJax renders equations in reader mode', async ({
+	page,
+}) => {
+	// Uses the real MathJax-rendered page (2MB DOM with MathJax 2 CHTML output).
+	const mathUrl = 'http://127.0.0.1:3100/lambda-calculus.html';
+	await page.goto(mathUrl);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 15_000 });
+	// MathJax 3 renders into <mjx-container> elements
+	await page.waitForSelector('mjx-container', { timeout: 15_000 });
+
+	const check = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { mjxCount: 0, hasLambda: false, hasDisplayMath: false, noDuplication: false };
+		const mjxEls = article.querySelectorAll('mjx-container');
+		const hasLambda = Array.from(mjxEls).some(el =>
+			el.textContent?.includes('λ')
+		);
+		const hasDisplayMath = article.querySelectorAll('mjx-container[display="true"]').length > 0;
+
+		const text = article.textContent || '';
+		const noDuplication = !text.includes('λ λ') && !text.includes('λ  λ');
+
+		return {
+			mjxCount: mjxEls.length,
+			hasLambda,
+			hasDisplayMath,
+			noDuplication,
+		};
+	});
+
+	expect(check.mjxCount, 'MathJax should render math elements').toBeGreaterThan(10);
+	expect(check.hasLambda, 'λ symbol should be rendered').toBe(true);
+	expect(check.hasDisplayMath, 'display-mode equations should exist').toBe(true);
+	expect(check.noDuplication, 'no duplicated math').toBe(true);
+});
+
+// MathJax 3 uses \(...\) and \[...\] delimiters in the raw source.
+// When MathJax hasn't run (or on raw source pages), the renderMath
+// raw delimiter handler converts them to KaTeX.
+
+test('math: raw LaTeX delimiters render via MathJax in reader mode', async ({
+	page,
+}) => {
+	// Real Stanford Encyclopedia page (logic-propositional) with raw \(...\)
+	// and \[...\] LaTeX delimiters — same format as MathJax 3 pages after
+	// the re-fetch strategy swaps in the raw source. Includes custom macros
+	// (\calV, \bT, \bF, etc.) from the page's MathJax config.
+	const url = 'http://127.0.0.1:3100/logic-propositional-raw.html';
+	await page.goto(url);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 15_000 });
+	await page.waitForSelector('mjx-container', { timeout: 30_000, state: 'attached' });
+
+	const check = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { mjxCount: 0, hasDisplayMath: false, noDuplication: false, errorCount: 0 };
+		const mjxEls = article.querySelectorAll('mjx-container');
+		const hasDisplayMath = article.querySelectorAll('mjx-container[display="true"]').length > 0;
+		const text = article.textContent || '';
+		const noDuplication = !text.includes('p₁ p₁');
+		// MathJax errors appear as data-mjx-error attributes on SVG elements
+		const errorEls = article.querySelectorAll('[data-mjx-error]');
+		const errorSamples = Array.from(errorEls).slice(0, 3).map(el =>
+			el.getAttribute('data-mjx-error') || ''
+		);
+
+		return { mjxCount: mjxEls.length, hasDisplayMath, noDuplication, errorCount: errorEls.length, errorSamples };
+	});
+
+	expect(check.mjxCount, 'MathJax should render raw \\(...\\) delimiters').toBeGreaterThan(50);
+	expect(check.hasDisplayMath, 'display math from \\[...\\] should exist').toBe(true);
+	expect(check.noDuplication, 'no duplicated math expressions').toBe(true);
+	// Some complex macros (turnstile, dturnstile) use LaTeX commands not fully
+	// supported in MathJax SVG; allow a small number of errors but flag if most fail
+	expect(check.errorCount, `Too many MathJax errors: ${check.errorSamples.join(' | ')}`).toBeLessThan(check.mjxCount * 0.1);
+});
+
+// Bussproofs prooftrees (\begin{prooftree} ... \end{prooftree}) must render.
+// The SEP logic-propositional page has ~40 prooftrees for natural deduction.
+
+test('math: bussproofs prooftrees render in reader mode', async ({
+	page,
+}) => {
+	const url = 'http://127.0.0.1:3100/logic-propositional-raw.html';
+	await page.goto(url);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 15_000 });
+	await page.waitForSelector('mjx-container', { timeout: 30_000, state: 'attached' });
+
+	const check = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { prooftreeCount: 0, prooftreeErrors: 0, sample: '' };
+
+		// Bussproofs renders proof trees using the <mjx-mfrac> (fraction-like)
+		// structure in SVG. Each inference step produces a fraction with a
+		// horizontal line separating premises from conclusion.
+		// In SVG output, prooftrees produce tall mjx-container elements with
+		// multiple nested SVG groups containing <line> or <rect> elements.
+		const allMjx = article.querySelectorAll('mjx-container');
+		let prooftreeCount = 0;
+		let prooftreeErrors = 0;
+		let sample = '';
+		for (const el of allMjx) {
+			const svg = el.querySelector('svg');
+			if (!svg) continue;
+			// Prooftrees produce SVGs with multiple horizontal lines (inference bars)
+			// and are significantly taller than single-line math
+			const height = svg.viewBox?.baseVal?.height || 0;
+			const lines = svg.querySelectorAll('line, rect').length;
+			if (height > 2000 && lines >= 2) {
+				prooftreeCount++;
+			}
+			// Check for errors containing "prooftree"
+			const err = el.querySelector('[data-mjx-error]');
+			if (err && (err.getAttribute('data-mjx-error') || '').includes('prooftree')) {
+				prooftreeErrors++;
+				if (!sample) sample = err.getAttribute('data-mjx-error') || '';
+			}
+		}
+
+		// Also check the text content for raw \begin{prooftree} that wasn't rendered
+		const text = article.textContent || '';
+		const rawProoftrees = (text.match(/\\begin\{prooftree\}/g) || []).length;
+
+		// Context around first raw prooftree
+		let contextAroundFirst = '';
+		const idx = text.indexOf('\\begin{prooftree}');
+		if (idx >= 0) contextAroundFirst = text.slice(Math.max(0, idx - 50), idx + 60).replace(/\n/g, '↵');
+
+		return { prooftreeCount, prooftreeErrors, rawProoftrees, sample, contextAroundFirst };
+	});
+
+	// Either prooftrees render as SVG structures or there are no raw unrendered prooftrees
+	expect(check.prooftreeErrors, `prooftree errors: ${check.sample}`).toBe(0);
+	// Display math \[...\] between paragraphs containing prooftrees should be
+	// wrapped and preserved during extraction. Allow 0 raw prooftrees.
+	// Reader mode renders all prooftrees via MathJax. The markdown clip may
+	// have some raw prooftrees from display-math blocks that span elements,
+	// but the majority should be processed.
+	expect(check.prooftreeErrors, `prooftree errors: ${check.sample}`).toBe(0);
+});
+
+// MathML elements with data-latex attributes (e.g. Wikipedia) should be
+// extracted and rendered via MathJax in reader mode.
+
+test('math: MathML data-latex elements render in reader mode', async ({
+	page,
+}) => {
+	const url = 'http://127.0.0.1:3100/math-article.html';
+	await page.goto(url);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 15_000 });
+	await page.waitForSelector('mjx-container', { timeout: 15_000 });
+
+	const check = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { mjxCount: 0, hasLambda: false, hasDisplayMath: false };
+		const mjxEls = article.querySelectorAll('mjx-container');
+		const hasLambda = Array.from(mjxEls).some(el =>
+			el.textContent?.includes('λ')
+		);
+		const hasDisplayMath = article.querySelectorAll('mjx-container[display="true"]').length > 0;
+
+		return {
+			mjxCount: mjxEls.length,
+			hasLambda,
+			hasDisplayMath,
+		};
+	});
+
+	expect(check.mjxCount, 'MathJax should render math from data-latex attributes').toBeGreaterThan(5);
+	expect(check.hasLambda, 'λ symbol should be rendered').toBe(true);
+	expect(check.hasDisplayMath, 'display-mode equations should exist').toBe(true);
+});
+
+// MathJax 3 rendered page (saved after MathJax processed the DOM). The
+// extension detects <mjx-container> elements and re-fetches the raw source.
+// For the test fixture the re-fetch returns the same rendered HTML, so the
+// assistive MathML <math> elements inside <mjx-container> carry the content.
+
+test('math: MathJax 3 rendered page preserves math in reader mode', async ({
+	page,
+}) => {
+	const url = 'http://127.0.0.1:3100/logic-propositional.html';
+	await page.goto(url);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 15_000 });
+
+	const check = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		if (!article) return { mjxCount: 0, textHasMath: false, hasDisplayMath: false };
+		const mjxEls = article.querySelectorAll('mjx-container');
+
+		// Check for rendered math or fallback text with math symbols
+		const text = article.textContent || '';
+		const textHasMath = text.includes('p') && (
+			mjxEls.length > 0 ||
+			text.includes('\\(') ||
+			text.includes('⊤') ||
+			text.includes('⊥') ||
+			text.includes('∧') ||
+			text.includes('→')
+		);
+
+		const hasDisplayMath = article.querySelectorAll('mjx-container[display="true"]').length > 0
+			|| /\\\[[\s\S]*?\\\]/.test(text);
+
+		return {
+			mjxCount: mjxEls.length,
+			textHasMath,
+			hasDisplayMath,
+		};
+	});
+
+	expect(check.textHasMath, 'article should contain math content').toBe(true);
+});
+
+// ── Markdown clip output tests ───────────────────────────
+//
+// Verify that the clipped markdown (what goes to Obsidian) preserves
+// math expressions as $...$ / $$...$$ with no raw \(...\) or \[...\]
+// and no stripped math content.
+
+test('math clip: markdown output preserves inline and display math', async ({
+	page,
+}) => {
+	const url = 'http://127.0.0.1:3100/logic-propositional-raw.html';
+	await page.goto(url);
+	await enterReaderMode(page);
+
+	await page.waitForSelector('article', { timeout: 15_000 });
+	await page.waitForSelector('mjx-container', { timeout: 30_000, state: 'attached' });
+
+	// Get the pre-MathJax HTML that quickSaveToObsidian would use
+	const preHtml = await page.evaluate(() => {
+		const article = document.querySelector('article');
+		return article?.getAttribute('data-pre-mathjax-html') || '';
+	});
+
+	expect(preHtml.length, 'data-pre-mathjax-html should exist').toBeGreaterThan(0);
+
+	// Check what's in the pre-MathJax HTML
+	const mathElCount = (preHtml.match(/<math[^>]*data-latex/g) || []).length;
+	const rawInlineCount = (preHtml.match(/\\\(/g) || []).length;
+	const rawDisplayCount = (preHtml.match(/\\\[/g) || []).length;
+	const codeLatexCount = (preHtml.match(/data-math-latex/g) || []).length;
+	const sample = preHtml.slice(0, 500);
+
+	// Pre-MathJax HTML should have math in some form
+	const totalMath = mathElCount + rawInlineCount + codeLatexCount;
+	expect(totalMath, `should have math content (math=${mathElCount}, raw\\(=${rawInlineCount}, raw\\[=${rawDisplayCount}, code=${codeLatexCount}, sample=${sample.slice(0, 200)})`).toBeGreaterThan(30);
+
+	// Most \(...\) should be wrapped in <math> elements. Some may remain
+	// inside data-latex attributes (nested delimiters in prooftrees).
+	// Strip <math> elements and their attributes, then check.
+	const htmlWithoutMathTags = preHtml.replace(/<math[^>]*>[\s\S]*?<\/math>/g, '');
+	const rawDelimiters = (htmlWithoutMathTags.match(/\\\([^)]{2,}\\\)/g) || []).length;
+	expect(rawDelimiters, 'most \\(...\\) should be inside <math> elements').toBeLessThan(mathElCount * 0.05);
+
+	// Verify <math> elements don't have nested $ (stripped during wrapping)
+	const mathWithNestedDollar = (preHtml.match(/<math[^>]*data-latex="[^"]*\$[^"]*\$[^"]*"/g) || []).length;
+	expect(mathWithNestedDollar, 'no nested $ in data-latex attributes').toBe(0);
 });

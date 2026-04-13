@@ -45,6 +45,7 @@
 		"css-loader": "^7.1.2",
 		"dotenv": "^16.4.1",
 		"esbuild": "^0.25.0",
+		"jsdom": "^29.0.2",
 		"mini-css-extract-plugin": "^2.9.1",
 		"sass": "^1.77.8",
 		"sass-loader": "^16.0.1",
@@ -60,11 +61,12 @@
 	"dependencies": {
 		"@types/safari-extension": "^0.0.33",
 		"dayjs": "^1.11.13",
-		"defuddle": "^0.16.0",
+		"defuddle": "file:../defuddle",
 		"dompurify": "^3.0.9",
 		"highlight.js": "^11.11.1",
 		"linkedom": "^0.18.0",
 		"lucide": "^0.359.0",
-		"lz-string": "^1.5.0"
+		"lz-string": "^1.5.0",
+		"mathjax-full": "^3.2.2"
 	}
 }

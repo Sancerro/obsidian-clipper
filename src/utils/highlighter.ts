@@ -629,7 +629,7 @@ export function saveHighlights() {
 	// Don't store Obsidian note highlights in browser storage
 	if (document.documentElement.dataset.obsidianNotePath) return;
 
-	const url = window.location.href;
+	const url = window.location.href.replace(/#.*$/, '');
 	if (highlights.length > 0) {
 		const data: StoredData = { highlights, url };
 		browser.storage.local.get('highlights').then((result: { highlights?: HighlightsStorage }) => {
@@ -719,7 +719,7 @@ export async function loadHighlights() {
 		return;
 	}
 
-	const url = window.location.href;
+	const url = window.location.href.replace(/#.*$/, '');
 	const result = await browser.storage.local.get('highlights');
 	const allHighlights = (result.highlights || {}) as HighlightsStorage;
 	const storedData = allHighlights[url];
@@ -748,7 +748,7 @@ export async function loadHighlights() {
 
 // Clear all highlights from the page and storage
 export function clearHighlights() {
-	const url = window.location.href;
+	const url = window.location.href.replace(/#.*$/, '');
 	const oldHighlights = [...highlights];
 
 	// Clear legacy overlay highlights
@@ -767,7 +767,7 @@ export function clearHighlights() {
 	// Clear text-anchor marks (DOM + local + plugin).
 	// Remove from plugin first, then local — partial plugin failure won't leave
 	// local cleared state that gets re-synced from plugin on next refresh.
-	const normalizedUrl = url.replace(/#:~:text=[^&]+(&|$)/, '');
+	const normalizedUrl = url.replace(/#.*$/, '');
 	document.querySelectorAll('.reading-selection-highlight-mark').forEach(m => {
 		m.replaceWith(...Array.from(m.childNodes));
 	});

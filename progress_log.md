@@ -1,5 +1,67 @@
 # Progress Log: Bidirectional Highlight Sync
 
+## 2026-04-13
+
+### Goal
+Get MathJax working properly so all LaTeX on a page (especially https://plato.stanford.edu/entries/logic-propositional/) renders correctly in reader mode.
+
+### Diagnosis
+- The extension used `tex-svg.js` (base MathJax build) which doesn't include TeX extensions like `bussproofs`, `extpfeil`, `centernot`
+- The `mathjax-extensions/` directory was copied but the autoload path resolution was broken (MathJax expected `input/tex/extensions/` not `mathjax-extensions/`)
+- Pages using MathML with `data-latex` attributes (e.g., Wikipedia) had their `<math>` elements removed without extracting the LaTeX first
+- KaTeX-rendered pages were not handled at all
+- Custom page macros (`\calV`, `\bT`, `\bF`, etc.) were extracted correctly but MathJax's `configmacros` extension wasn't applying them in the combined build context
+
+### Changes
+
+**`webpack.config.js`**:
+- Switched from `tex-svg.js` to `tex-svg-full.js` (~170KB larger but includes ALL TeX extensions)
+- Removed `mathjax-extensions/` copy (no longer needed since full build is self-contained)
+
+**`src/manifest.chrome.json`, `src/manifest.firefox.json`, `src/manifest.safari.json`**:
+- Removed `mathjax-extensions/*` from `web_accessible_resources`
+
+**`src/utils/reader.ts`**:
+- Added KaTeX extraction: before cleanup, extract LaTeX from `.katex` containers via `<annotation encoding="application/x-tex">` elements
+- Added MathML `data-latex` extraction: before removing `<math>` elements, convert ones with `data-latex` attributes to `code[data-math-latex]` placeholders
+- Added `\newcommand` preamble injection: when page-specific macros are extracted, inject them as a hidden `\newcommand` block at the top of the article so MathJax processes them via standard LaTeX semantics (works around `configmacros` not picking up macros in combined builds)
+
+**`e2e/fixtures/logic-propositional-raw.html`**:
+- Added inline `<script>` with the SEP page's MathJax macros (from `local.js`) so tests can validate macro extraction and rendering
+
+**`e2e/sync.spec.ts`**:
+- Updated raw LaTeX test to verify custom macro rendering with error tolerance (some complex macros like `\turnstile` use `\scriptsize` which isn't fully supported in MathJax SVG math mode)
+- Added MathML `data-latex` test using `math-article.html` fixture
+- Added MathJax 3 rendered page test using `logic-propositional.html` fixture
+
+### Defuddle fixes (`/Users/baris/Desktop/defuddle/`)
+
+**`src/elements/math.base.ts`**:
+- Removed `hasMathLibrary()` gate for backslash delimiters (`\[...\]`, `\(...\)`) — these are unambiguous math markers and should always be wrapped. Dollar delimiters (`$`, `$$`) still gated on math library detection to avoid currency false positives.
+
+### Obsidian plugin (`reading-selection-highlight`)
+
+**`src/main.ts`**:
+- Added `configureMathJaxExtensions()` — loads `bussproofs`, `extpfeil`, `centernot` into Obsidian's MathJax so proof trees and extended arrows render in notes.
+
+### Clipper: removed buggy string-level regex
+
+**`src/utils/reader.ts` `extractContent()`**:
+- Removed string-level `\[...\]` and `\(...\)` regex replacements (lines 870-880) that created `<code data-math-latex>` elements. These caused nested HTML corruption when `\(` appeared inside `\[...\]` display math (e.g., prooftrees). Defuddle's DOM-level `wrapRawLatexDelimiters()` handles this correctly now.
+
+### Known remaining issue
+- Inline prooftrees in clipped markdown have nested `$` delimiters: `$\begin{prooftree}\AxiomC{$A$}...$` — the inner `$` breaks the outer `$`. Needs Defuddle markdown converter fix.
+
+### Test results
+All 50 e2e tests pass, including 5 math-specific tests:
+1. MathJax 2 (lambda-calculus.html) — MathJax renders equations ✓
+2. Raw LaTeX delimiters (logic-propositional-raw.html) — with custom macros ✓
+3. Bussproofs prooftrees (logic-propositional-raw.html) — no raw prooftrees remain ✓
+4. MathML data-latex (math-article.html) — Wikipedia-style ✓
+5. MathJax 3 rendered (logic-propositional.html) — preserves math ✓
+
+---
+
 ## 2026-04-06
 
 ### Goal
@@ -347,3 +409,16 @@ Codex identified responsibility and coupling issues. Refactored:
   - Both paths sanitize the subfolder name with the same `[\\/:*?"<>|]` character set as the title.
   - Attributes cleaned up in `reader.ts:restore()` on reader mode exit.
 - Examples: an article by "John Gruber" on daringfireball.net → `Clippings/John Gruber/article.md`. A page with no author on reddit.com → `Clippings/reddit.com/article.md`. A page with neither → `Clippings/article.md`.
+
+## 2026-04-12 (session 2)
+
+### Theme persistence feature
+- **Problem**: The d-key shortcut in reader mode toggled `theme-light`/`theme-dark` CSS classes but never persisted the choice. Exiting and re-entering reader mode (or navigating to a new page) reset to the default `auto` appearance.
+- **Root cause**: The d-key handler directly manipulated CSS classes without calling `updateThemeMode()`, which handles both the visual toggle AND settings persistence.
+- **Fix**: Changed d-key handler to call `this.updateThemeMode(doc, newMode)` and sync the settings bar dropdown via `data-setting-id="reader-appearance"`.
+- **Storage bug discovered**: `browser.storage.sync.set()` called from content scripts injected via `chrome.scripting.executeScript` silently fails to persist. Discovered after extensive debugging — the initial `saveSettings` from `apply()` worked, but subsequent calls from event handlers did not.
+- **Fix for storage**: Route all `saveSettings()` calls through `browser.runtime.sendMessage({ action: 'saveReaderSettings', settings })` to the background script, which has reliable `storage.sync` access. Added `saveReaderSettings` handler in `background.ts`.
+- **Build system lesson**: `bun run build` outputs to `dist/`, but e2e tests load the extension from `dev/`. Must use `bun run build:chrome:dev` (or `bun run test:e2e`) to build to the correct directory. Wasted significant debugging time running tests against stale code.
+- **Test changes**: Updated midnight theme test to set theme through `storage.sync` pre-seeding (via service worker) instead of direct DOM manipulation, since `updateThemeMode` now also calls `applyTheme()` which reads the effective theme from settings.
+- **New test**: "theme persistence: d-key toggle survives navigation to a new page" — presses d, opens a fresh tab, verifies dark theme persists.
+- **Result**: 44 tests pass (43 → 44), all against real plugin, no mocks.
