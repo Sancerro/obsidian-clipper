@@ -7,6 +7,7 @@ import { extractContentBySelector as extractContentBySelectorShared } from './ut
 import { createMarkdownContent } from 'defuddle/full';
 import { flattenShadowDom } from './utils/flatten-shadow-dom';
 import { saveFile } from './utils/file-utils';
+import { normalizeProoftreesForObsidian } from './utils/prooftree-markdown';
 import { autoClipPage, showReaderToast } from './utils/reader-highlights';
 
 declare global {
@@ -234,7 +235,7 @@ declare global {
 					);
 					const defuddled = await Promise.race([defuddle.parseAsync(), parseTimeout])
 						.catch(() => defuddle.parse());
-					const markdown = createMarkdownContent(defuddled.content, document.URL);
+					const markdown = normalizeProoftreesForObsidian(createMarkdownContent(defuddled.content, document.URL));
 					sendResponse({ success: true, markdown, title: defuddled.title || document.title });
 				} catch (err) {
 					sendResponse({ success: false, error: (err as Error).message });
@@ -250,7 +251,7 @@ declare global {
 					const defuddled = new Defuddle(document, { url: document.URL }).parse();
 
 					// Convert HTML content to markdown
-					const markdown = createMarkdownContent(defuddled.content, document.URL);
+					const markdown = normalizeProoftreesForObsidian(createMarkdownContent(defuddled.content, document.URL));
 
 					// Copy to clipboard
 					const textArea = document.createElement("textarea");
@@ -273,7 +274,7 @@ declare global {
 			flattenShadowDom(document).then(async () => {
 				try {
 					const defuddled = new Defuddle(document, { url: document.URL }).parse();
-					const markdown = createMarkdownContent(defuddled.content, document.URL);
+					const markdown = normalizeProoftreesForObsidian(createMarkdownContent(defuddled.content, document.URL));
 					const title = defuddled.title || document.title || 'Untitled';
 					const fileName = title.replace(/[/\\?%*:|"<>]/g, '-');
 					let saveError: Error | null = null;

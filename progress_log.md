@@ -1,5 +1,61 @@
 # Progress Log: Bidirectional Highlight Sync
 
+## 2026-04-14
+
+### Goal
+Fix prooftree rendering in both reader mode and clipped markdown output. The SEP propositional logic page uses two bussproofs syntaxes: `\AxiomC{...}` (C-variant) and `\Axiom$...\fCenter...$` (non-C/sequent calculus variant). Neither rendered correctly.
+
+### Problems found
+
+1. **Nested `$` in clipped markdown**: Defuddle's `createMarkdownContent` fallback regex converted `\(...\)` → `$...$` inside prooftree blocks, producing broken `\AxiomC{$A$}` nested delimiters in `$$` blocks.
+2. **Multi-tree `$$` blocks**: Display math `\[...\]` blocks containing multiple prooftrees with `\hspace`/`\quad` between them were kept as single `$$` blocks — Obsidian's MathJax couldn't render them.
+3. **`\Axiom$...$` syntax not parsed**: The custom proof tree renderer only handled `\AxiomC{...}` (C-variant). The non-C variant `\Axiom$...\fCenter...$` with `\def\fCenter{...}` was completely unsupported.
+4. **`$` stripped before parser saw it**: Defuddle's `wrapRawLatexDelimiters` stripped ALL `$...$` inside math blocks (line 422 of `math.base.ts`), removing the `$` delimiters from `\Axiom$...$` before the clipper's parser ever ran.
+5. **Display blocks consumed partially**: When a `\[...\]` block had a mix of parseable and unparseable trees, parseable ones were extracted individually, leaving broken `\[`, `\hspace`, `\]` fragments as raw text.
+6. **Missing Greek symbols**: `latexToReaderText` lacked entries for `\Gamma`, `\Delta`, `\Theta`, `\Lrightarrow`, etc., showing "GammaLrightarrowTheta" instead of Γ→Θ.
+7. **`wrapRawLatexDelimiters` not exported**: Defuddle's UMD build only attached `createMarkdownContent` as a static property, not `wrapRawLatexDelimiters`, causing `TypeError: wrapRawLatexDelimiters is not a function` at runtime.
+
+### Changes
+
+**Defuddle (`/Users/baris/Desktop/defuddle/`)**
+
+**`src/markdown.ts`**:
+- Added prooftree-aware step in the `\(...\)` → `$...$` fallback conversion: strip `\(...\)` inside `\begin{prooftree}...\end{prooftree}` blocks instead of wrapping them in `$...$` (fixes nested delimiter issue).
+- Added non-C bussproofs `\Axiom$...$` → `\Axiom{...}` conversion in the `mathml` turndown rule before generic `$` stripping.
+
+**`src/elements/math.base.ts`**:
+- Added non-C bussproofs `\Axiom$...$` → `\Axiom{...}` conversion in `wrapRawLatexDelimiters` before generic `$` stripping (the critical fix — without this, the clipper's parser never sees the `$` delimiters).
+
+**`src/index.full.ts`**:
+- Added `wrapRawLatexDelimiters` as a static property on the UMD default export so CJS consumers can access it.
+
+**`tests/expected/math--prooftree-nested.md`**:
+- Updated expected output: inline prooftrees now correctly become display math `$$` blocks.
+
+**Clipper (`/Users/baris/Desktop/obsidian-clipper/`)**
+
+**`src/utils/reader.ts`**:
+- Rewrote `renderStandaloneBussproofs`: now matches entire `\[...\]` display blocks containing prooftrees, renders all trees in a flex row. Only consumes blocks where ALL trees are parseable; leaves mixed blocks for MathJax. Tracks display block ranges so the single-tree pass doesn't extract trees from inside them.
+- Added `\def\fCenter{...}` parsing to `parseProofTree` — stores the center symbol for non-C syntax.
+- Extended inference match regex to handle both C-variant (`\AxiomC`, `\UnaryInfC`, etc.) and non-C variant (`\Axiom`, `\UnaryInf`, etc.) commands. Non-C arguments split on `\fCenter` to produce "left → right" formulas.
+- Updated `normalizeBussproofsLatex` to convert `\Axiom$...$` → `\Axiom{...}` before generic `$` stripping.
+- Added Greek letters (Γ, Δ, Θ, Σ, Π, α, β, γ, δ, φ, ψ), logic symbols (⊢, ∀, ∃, ⇔), and `\Lrightarrow` to `latexToReaderText`.
+
+**`src/utils/prooftree-markdown.ts`**:
+- Added `splitMultiTreeBlock` — extracts individual `\begin{prooftree}...\end{prooftree}` blocks from display math and gives each its own `$$` block with `\require{bussproofs}`. Strips `\hspace`/`\quad` (not meaningful in separate blocks).
+- Updated `normalizeProoftreesForObsidian` to use `splitMultiTreeBlock` for all display math containing prooftrees.
+
+**`src/utils/prooftree-markdown.test.ts`**:
+- Updated multi-tree test: now expects split `$$` blocks (2 pairs of `$$`) instead of preserved `\hspace` commands.
+
+### Current state
+- Reader mode: all ~40 prooftrees on the SEP logic-propositional page render (both natural deduction and sequent calculus). Mostly working.
+- Clip output: each prooftree gets its own clean `$$` block with `\require{bussproofs}` and no nested delimiters.
+- All 6 math e2e tests pass, all 10 prooftree unit tests pass.
+- The `entry.js` TypeError in console is from SEP's own jQuery scrollToFixed plugin — harmless, not our code.
+
+---
+
 ## 2026-04-13
 
 ### Goal
@@ -422,3 +478,196 @@ Codex identified responsibility and coupling issues. Refactored:
 - **Test changes**: Updated midnight theme test to set theme through `storage.sync` pre-seeding (via service worker) instead of direct DOM manipulation, since `updateThemeMode` now also calls `applyTheme()` which reads the effective theme from settings.
 - **New test**: "theme persistence: d-key toggle survives navigation to a new page" — presses d, opens a fresh tab, verifies dark theme persists.
 - **Result**: 44 tests pass (43 → 44), all against real plugin, no mocks.
+
+## 2026-04-14
+
+### Goal
+- Make `bussproofs` proof trees render correctly in Obsidian notes created by the clipper, while preserving actual `bussproofs` syntax instead of converting to a fallback math representation.
+- Record the full debugging path, including dead ends, in one place.
+
+### What the user reported
+- Initial screenshot: raw `\begin{prooftree} ... \end{prooftree}` showing in a saved note, not in reader mode.
+- Important correction from user: the failure was in Obsidian note rendering, not the extension reader.
+
+### First diagnosis
+- The clipper was saving proof trees in forms Obsidian/MathJax did not like:
+  - wrapped in `$...$` or `$$...$$` in ways that left nested math delimiters inside `\AxiomC{...}`
+  - malformed mixed wrappers such as `$\begin{prooftree} ... \end{prooftree}\)`
+- Even when the note looked closer to valid `bussproofs`, Obsidian still did not render it because the runtime `bussproofs` package load was unreliable.
+
+### Clipper-side fixes
+
+#### Saved markdown normalization
+- Added `src/utils/prooftree-markdown.ts`
+  - normalizes malformed saved proof-tree markdown
+  - strips nested inner delimiters inside proof-tree command arguments
+  - preserves actual `bussproofs` syntax
+  - injects `\require{bussproofs}` into proof-tree expressions
+- Wired it into all clip/save paths:
+  - `src/utils/reader.ts`
+  - `src/utils/reader-highlights.ts`
+  - `src/content.ts`
+  - `src/api.ts`
+  - `src/utils/content-extractor.ts`
+
+#### Regression coverage
+- Added tests:
+  - `src/utils/prooftree-markdown.test.ts`
+  - `src/utils/prooftree-clip-output.test.ts`
+  - reused `src/utils/reader.test.ts`
+- The intent of these tests:
+  - pin the broken saved-note shapes we actually observed
+  - ensure future clipping keeps real `bussproofs`
+  - ensure malformed nested delimiters are cleaned before save
+
+### What worked on the clipper side
+- Existing broken notes were successfully rewritten into cleaner proof-tree forms.
+- The main SEP clipping note was regenerated from the local raw fixture and restored to valid proof-tree math blocks.
+- The test note was reduced to a minimal single proof-tree block for faster debugging.
+
+### What did NOT solve the problem
+
+#### 1. Old `obsidian-latex` / Extended MathJax plugin
+- The plugin was installed but not enabled.
+- Enabling it plus adding `preamble.sty` did not solve rendering.
+- Reading its source showed it only loaded the preamble text; it did not explicitly and robustly load `bussproofs` for the active MathJax instance.
+- A local patch was attempted to force-load `require` and `bussproofs`.
+- Result:
+  - first patch caused plugin load failures
+  - defensive patch stopped the load failure
+  - but actual proof-tree rendering still failed in notes
+
+#### 2. Converting proof trees to `\cfrac` / `\genfrac`
+- I briefly switched to a “just make it standard MathJax” strategy by converting `prooftree` to `\cfrac`.
+- User explicitly rejected this because the requirement is to keep actual `bussproofs`.
+- That path was reverted.
+
+### Important discovery from console logs
+- The user supplied logs from `reading-selection-highlight`:
+  - `[bp] installBussproofs called`
+  - `[bp] MathJax ready`
+  - `[bp] ConfigurationHandler found`
+  - `[bp] bussproofs already in MathJax._`
+  - `[bp] bpConfig found`
+  - `[bp] already installed, re-typesetting...`
+  - `[bp] re-typeset done`
+- This proved that `reading-selection-highlight` was already installing `bussproofs` into Obsidian's MathJax.
+- So the remaining issue was not package registration alone.
+
+### Custom local Obsidian plugin attempts
+
+#### Attempt A: custom `bussproofs-renderer` plugin
+- Created a new vault-local plugin at:
+  - `Grimoire/.obsidian/plugins/bussproofs-renderer`
+- Disabled `obsidian-latex` in `community-plugins.json`
+- Goal:
+  - bypass Obsidian's inconsistent preview behavior
+  - detect proof-tree note content directly
+  - ask MathJax to typeset just those proof-tree blocks
+  - log every failure clearly
+
+#### Attempt B: first implementation bug
+- The generated plugin file was mangled by shell escaping and failed syntax check.
+- Fixed by rewriting the plugin file literally and validating with `node --check`.
+
+#### Attempt C: wrong target layer in DOM
+- Plugin initially found proof trees and said it “rendered” them, but the visual result was duplicated/garbled.
+- Root cause: it was targeting duplicate/wrong wrapper layers.
+- Fix:
+  - narrowed targeting to real `.math-block` nodes
+  - render in place
+  - mark processed blocks
+
+#### Attempt D: plugin loaded but found nothing
+- Added startup marker versions:
+  - `loading v0.0.2`
+  - `loading v0.0.3`
+  - `loading v0.0.4`
+  - `loading v0.0.5`
+- This confirmed Obsidian was actually loading the latest file and not a cached copy.
+- Added lifecycle logging:
+  - `postprocessor`
+  - `file-open`
+  - `active-leaf-change`
+  - `layout-ready`
+  - explicit rescans
+- Added candidate-root logging per markdown leaf:
+  - `view.containerEl`
+  - `view.contentEl`
+  - `previewMode.containerEl`
+  - `.markdown-preview-view`
+  - `.markdown-reading-view`
+  - `.markdown-rendered`
+- This found the correct root: `view.containerEl` for the test note.
+
+#### Attempt E: decisive MathJax error surfaced
+- Once the correct root was found, the plugin logged the real error:
+  - `\supset is only supported in math mode`
+- The failing LaTeX was:
+  - `\begin{prooftree} \AxiomC{A \supset B} \AxiomC{A} \BinaryInfC{B} \end{prooftree}`
+- Root cause:
+  - `bussproofs` arguments like `\AxiomC{...}` are parsed as text unless the content inside is explicitly math.
+  - So `\AxiomC{A \supset B}` is wrong for MathJax `bussproofs`.
+
+#### Attempt F: proof-tree argument normalization
+- Patched the custom plugin to rewrite proof-tree command arguments before calling MathJax:
+  - `\AxiomC{A \supset B}` → `\AxiomC{$A \supset B$}`
+  - same idea for `UnaryInfC`, `BinaryInfC`, `TrinaryInfC`, `RightLabel`, `LeftLabel`
+- Startup marker bumped to `loading v0.0.5`
+- Result:
+  - success
+  - the plugin found one proof-tree target
+  - rendered it successfully in the test note
+
+### Current working state
+- The custom plugin `bussproofs-renderer` is active.
+- `obsidian-latex` is disabled.
+- `reading-selection-highlight` still logs that it installs `bussproofs`.
+- The test note renders a proof tree in Obsidian.
+- The visual result is now “rendered but rough”, which is a styling/layout refinement problem rather than a parser/load failure.
+
+### What worked
+- Reproducing the actual error instead of assuming package-loading was enough.
+- Instrumenting the custom plugin heavily:
+  - explicit version markers
+  - file-open / postprocessor / rescan logs
+  - candidate root discovery
+  - exact MathJax error capture
+- Targeted normalization of `\AxiomC{...}` and related commands to wrap arguments in math mode.
+
+### What did not work
+- Relying on `obsidian-latex` alone
+- Assuming `\require{bussproofs}` in the note would be sufficient
+- Assuming `reading-selection-highlight` package registration alone implied note rendering would work
+- DOM targeting based on the wrong preview wrapper
+- Early custom plugin versions that replaced the wrong DOM layer
+- The temporary `\cfrac` conversion path (reverted)
+
+### Files touched during this session
+
+#### Clipper repo
+- `src/utils/prooftree-markdown.ts`
+- `src/utils/prooftree-markdown.test.ts`
+- `src/utils/prooftree-clip-output.test.ts`
+- `src/utils/reader.ts`
+- `src/utils/reader-highlights.ts`
+- `src/content.ts`
+- `src/api.ts`
+- `src/utils/content-extractor.ts`
+
+#### Vault / Obsidian
+- `Grimoire/.obsidian/community-plugins.json`
+- `Grimoire/.obsidian/plugins/obsidian-latex/main.js` (temporary patching attempt)
+- `Grimoire/.obsidian/plugins/bussproofs-renderer/main.js`
+- `Grimoire/.obsidian/plugins/bussproofs-renderer/manifest.json`
+- `Grimoire/preamble.sty`
+- `Grimoire/Bussproofs Test.md`
+- `Grimoire/Clippings/stanford.edu/Propositional Logic (Stanford Encyclopedia of Philosophy).md`
+
+### Notes on unresolved follow-up
+- The proof tree now renders, but the layout/spacing is not yet polished.
+- The next step is visual refinement:
+  - spacing
+  - centering
+  - handling multiple proof trees in one display block
+  - deciding whether to keep using MathJax output directly or decorate it

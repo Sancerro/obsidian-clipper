@@ -4,6 +4,7 @@
 
 import DefuddleClass from 'defuddle';
 import { createMarkdownContent } from 'defuddle/full';
+import { normalizeProoftreesForObsidian } from './utils/prooftree-markdown';
 import { compileTemplate, SelectorProcessor } from './utils/template-compiler';
 import { AsyncResolver, RenderContext } from './utils/renderer';
 import { applyFilters } from './utils/filters';
@@ -186,7 +187,7 @@ export async function clip(options: ClipOptions): Promise<ClipResult> {
 	const defuddleResult = defuddle.parse();
 
 	// Convert to markdown
-	const markdownContent = createMarkdownContent(defuddleResult.content, url);
+	const markdownContent = normalizeProoftreesForObsidian(createMarkdownContent(defuddleResult.content, url));
 
 	// Build template variables
 	const variables = buildVariables({

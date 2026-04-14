@@ -12,6 +12,8 @@ import { copyToClipboard } from './clipboard-utils';
 import { getMessage, initializeI18n } from './i18n';
 import { getFontCss } from './font-utils';
 import { logHandledError } from './error-utils';
+import { renderMacroDefsForObsidian } from './obsidian-math-macros';
+import { normalizeProoftreesForObsidian } from './prooftree-markdown';
 import { wireTranscript } from './reader-transcript';
 
 type MathJaxMacroMap = Record<string, string | [string, number]>;
@@ -944,22 +946,26 @@ export class Reader {
 		// createMarkdownContent's turndown rules convert them to $...$.
 		const rawHtml = article.getAttribute('data-pre-mathjax-html') || article.innerHTML;
 		const tempDoc = new DOMParser().parseFromString(`<article>${rawHtml}</article>`, 'text/html');
+		// Propagate macros so turndown rules can expand them in prooftrees
+		const macroAttr = doc.documentElement.getAttribute('data-math-macros');
+		if (macroAttr) tempDoc.documentElement.setAttribute('data-math-macros', macroAttr);
 		const tempArticle = tempDoc.querySelector('article');
 		if (tempArticle) {
 			const { wrapRawLatexDelimiters } = await import('defuddle/full');
 			wrapRawLatexDelimiters(tempArticle, tempDoc);
 		}
 		const articleHtml = tempArticle?.innerHTML || rawHtml;
-		let markdown = createMarkdownContent(articleHtml, url);
+		// Pass macros so prooftree blocks get expanded inline
+		let mathMacros: Record<string, string | [string, number]> | undefined;
+		if (macroAttr) {
+			try { mathMacros = JSON.parse(macroAttr); } catch {}
+		}
+		let markdown = createMarkdownContent(articleHtml, url, { macros: mathMacros });
+		markdown = normalizeProoftreesForObsidian(markdown);
 
 		// Prepend \newcommand definitions for page-specific macros so
 		// Obsidian's MathJax can resolve them when rendering the note.
-		const macroDefs = Object.entries(this.getMathJaxMacros(doc)).map(([name, val]) => {
-			if (Array.isArray(val)) {
-				return `\\newcommand{${name}}[${val[1]}]{${val[0]}}`;
-			}
-			return `\\newcommand{${name}}{${val}}`;
-		}).join('\n');
+		const macroDefs = renderMacroDefsForObsidian(this.getMathJaxMacros(doc));
 		if (macroDefs) {
 			markdown = `$$\n${macroDefs}\n$$\n\n${markdown}`;
 		}
@@ -2593,8 +2599,9 @@ export class Reader {
 
 		let text = latex
 			.replace(/\\lambda\b/g, 'λ')
-			.replace(/\\(?:to|rightarrow)\b/g, '→')
+			.replace(/\\(?:to|rightarrow|Lrightarrow)\b/g, '→')
 			.replace(/\\Rightarrow\b/g, '⇒')
+			.replace(/\\Leftrightarrow\b/g, '⇔')
 			.replace(/\\wedge\b/g, '∧')
 			.replace(/\\vee\b/g, '∨')
 			.replace(/\\neg\b/g, '¬')
@@ -2605,6 +2612,20 @@ export class Reader {
 			.replace(/\\rangle\b/g, '⟩')
 			.replace(/\\vdots\b/g, '⋮')
 			.replace(/\\cdot\b/g, '·')
+			.replace(/\\Gamma\b/g, 'Γ')
+			.replace(/\\Delta\b/g, 'Δ')
+			.replace(/\\Theta\b/g, 'Θ')
+			.replace(/\\Sigma\b/g, 'Σ')
+			.replace(/\\Pi\b/g, 'Π')
+			.replace(/\\alpha\b/g, 'α')
+			.replace(/\\beta\b/g, 'β')
+			.replace(/\\gamma\b/g, 'γ')
+			.replace(/\\delta\b/g, 'δ')
+			.replace(/\\phi\b/g, 'φ')
+			.replace(/\\psi\b/g, 'ψ')
+			.replace(/\\vdash\b/g, '⊢')
+			.replace(/\\forall\b/g, '∀')
+			.replace(/\\exists\b/g, '∃')
 			.replace(/\\text\{([^}]*)\}/g, '$1')
 			.replace(/\\mathrm\{([^}]*)\}/g, '$1')
 			.replace(/\\mathit\{([^}]*)\}/g, '$1')
@@ -2618,6 +2639,374 @@ export class Reader {
 
 		if (!text) text = latex.trim();
 		return text;
+	}
+
+	private static normalizeBussproofsLatex(latex: string): string {
+		if (!latex.includes('\\begin{prooftree}')) return latex;
+
+		return latex.replace(/\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\}/g, block => (
+			block
+				// Convert non-C syntax \Axiom$...$  →  \Axiom{...} before
+				// stripping generic $...$ so the parser can find them.
+				.replace(/\\(Axiom|UnaryInf|BinaryInf|TrinaryInf|QuaternaryInf|QuinaryInf)\$([^$]*)\$/g,
+					(_m, cmd, arg) => `\\${cmd}{${arg}}`)
+				.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
+				.replace(/\\\[([\s\S]*?)\\\]/g, '$1')
+				.replace(/\$([^$]+?)\$/g, '$1')
+		));
+	}
+
+	private static normalizeBussproofsMathText(text: string): string {
+		const normalizeStandalone = (_fullMatch: string, latex: string): string => (
+			this.normalizeBussproofsLatex(latex)
+		);
+
+		return text
+			.replace(/\\\(\s*(\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\})\s*\\\)/g, normalizeStandalone)
+			.replace(/\\\[\s*(\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\})\s*\\\]/g, normalizeStandalone);
+	}
+
+	private static extractBraceArgument(source: string, openBraceIndex: number): { value: string; endIndex: number } | null {
+		if (source[openBraceIndex] !== '{') return null;
+
+		let depth = 0;
+		let value = '';
+		for (let i = openBraceIndex; i < source.length; i++) {
+			const char = source[i];
+			if (char === '{') {
+				depth += 1;
+				if (depth > 1) value += char;
+				continue;
+			}
+			if (char === '}') {
+				depth -= 1;
+				if (depth === 0) return { value, endIndex: i + 1 };
+				value += char;
+				continue;
+			}
+			value += char;
+		}
+
+		return null;
+	}
+
+	private static proofTreeArgumentText(latex: string): string {
+		const normalized = latex
+			.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
+			.replace(/\\\[([\s\S]*?)\\\]/g, '$1')
+			.replace(/\$([^$]+?)\$/g, '$1');
+		return this.latexToReaderText(normalized);
+	}
+
+	private static parseProofTree(latex: string): {
+		premises: any[];
+		conclusion: string;
+		leftLabel?: string;
+		rightLabel?: string;
+		lineStyle?: 'solid' | 'dashed' | 'none';
+	} | null {
+		const source = this.normalizeBussproofsLatex(latex);
+		const stack: Array<{
+			premises: any[];
+			conclusion: string;
+			leftLabel?: string;
+			rightLabel?: string;
+			lineStyle?: 'solid' | 'dashed' | 'none';
+		}> = [];
+		let pendingLeftLabel = '';
+		let pendingRightLabel = '';
+		let pendingLineStyle: 'solid' | 'dashed' | 'none' = 'solid';
+		let fCenter = '→'; // default center symbol for \Axiom$...\fCenter...$
+
+		const makeInference = (
+			arity: number,
+			conclusion: string
+		): {
+			premises: any[];
+			conclusion: string;
+			leftLabel?: string;
+			rightLabel?: string;
+			lineStyle?: 'solid' | 'dashed' | 'none';
+		} | null => {
+			if (stack.length < arity) return null;
+			const premises = stack.splice(stack.length - arity, arity);
+			const node = {
+				premises,
+				conclusion,
+				leftLabel: pendingLeftLabel || undefined,
+				rightLabel: pendingRightLabel || undefined,
+				lineStyle: pendingLineStyle,
+			};
+			pendingLeftLabel = '';
+			pendingRightLabel = '';
+			pendingLineStyle = 'solid';
+			return node;
+		};
+
+		for (let i = 0; i < source.length;) {
+			if (source.startsWith('\\begin{prooftree}', i)) {
+				i += '\\begin{prooftree}'.length;
+				continue;
+			}
+			if (source.startsWith('\\end{prooftree}', i)) {
+				i += '\\end{prooftree}'.length;
+				continue;
+			}
+			if (source.startsWith('\\RightLabel', i) || source.startsWith('\\LeftLabel', i)) {
+				const isRight = source.startsWith('\\RightLabel', i);
+				i += isRight ? '\\RightLabel'.length : '\\LeftLabel'.length;
+				while (/\s/.test(source[i] || '')) i += 1;
+				const arg = this.extractBraceArgument(source, i);
+				if (!arg) return null;
+				const label = this.proofTreeArgumentText(arg.value);
+				if (isRight) pendingRightLabel = label;
+				else pendingLeftLabel = label;
+				i = arg.endIndex;
+				continue;
+			}
+			if (source.startsWith('\\noLine', i) || source.startsWith('\\alwaysNoLine', i)) {
+				pendingLineStyle = 'none';
+				i += source.startsWith('\\alwaysNoLine', i) ? '\\alwaysNoLine'.length : '\\noLine'.length;
+				continue;
+			}
+			if (source.startsWith('\\dashedLine', i) || source.startsWith('\\alwaysDashedLine', i)) {
+				pendingLineStyle = 'dashed';
+				i += source.startsWith('\\alwaysDashedLine', i) ? '\\alwaysDashedLine'.length : '\\dashedLine'.length;
+				continue;
+			}
+			if (
+				source.startsWith('\\singleLine', i)
+				|| source.startsWith('\\solidLine', i)
+				|| source.startsWith('\\alwaysSingleLine', i)
+				|| source.startsWith('\\alwaysSolidLine', i)
+			) {
+				pendingLineStyle = 'solid';
+				if (source.startsWith('\\alwaysSingleLine', i)) i += '\\alwaysSingleLine'.length;
+				else if (source.startsWith('\\alwaysSolidLine', i)) i += '\\alwaysSolidLine'.length;
+				else if (source.startsWith('\\singleLine', i)) i += '\\singleLine'.length;
+				else i += '\\solidLine'.length;
+				continue;
+			}
+
+			// \def\fCenter{...} — set center symbol for non-C syntax
+			if (source.startsWith('\\def\\fCenter', i)) {
+				i += '\\def\\fCenter'.length;
+				while (/\s/.test(source[i] || '')) i += 1;
+				const arg = this.extractBraceArgument(source, i);
+				if (arg) {
+					fCenter = this.latexToReaderText(arg.value);
+					i = arg.endIndex;
+				}
+				continue;
+			}
+
+			// C-variant bussproofs: \AxiomC{...}, \UnaryInfC{...}, etc.
+			// Also handles non-C variants (\Axiom, \UnaryInf, etc.) which
+			// normalizeBussproofsLatex converted from $...$ to {...} syntax.
+			const inferenceMatch = source.slice(i).match(/^\\(AxiomC|Axiom|UnaryInfC|UnaryInf|BinaryInfC|BinaryInf|TrinaryInfC|TrinaryInf|QuaternaryInfC|QuaternaryInf|QuinaryInfC|QuinaryInf)(?=\s*\{)/);
+			if (inferenceMatch) {
+				const command = inferenceMatch[1];
+				i += command.length + 1;
+				while (/\s/.test(source[i] || '')) i += 1;
+				const arg = this.extractBraceArgument(source, i);
+				if (!arg) return null;
+				// For non-C syntax, split on \fCenter
+				const hasCenter = arg.value.includes('\\fCenter');
+				let formula: string;
+				if (hasCenter) {
+					const parts = arg.value.split('\\fCenter');
+					formula = parts.map(p => this.proofTreeArgumentText(p.trim())).join(` ${fCenter} `);
+				} else {
+					formula = this.proofTreeArgumentText(arg.value);
+				}
+				i = arg.endIndex;
+
+				if (command === 'AxiomC' || command === 'Axiom') {
+					stack.push({ premises: [], conclusion: formula, lineStyle: 'solid' });
+					continue;
+				}
+
+				const arityMap: Record<string, number> = {
+					UnaryInfC: 1, UnaryInf: 1,
+					BinaryInfC: 2, BinaryInf: 2,
+					TrinaryInfC: 3, TrinaryInf: 3,
+					QuaternaryInfC: 4, QuaternaryInf: 4,
+					QuinaryInfC: 5, QuinaryInf: 5,
+				};
+				const node = makeInference(arityMap[command], formula);
+				if (!node) return null;
+				stack.push(node);
+				continue;
+			}
+
+			i += 1;
+		}
+
+		return stack.length ? stack[stack.length - 1] : null;
+	}
+
+	private static renderProofTreeNode(
+		node: {
+			premises: any[];
+			conclusion: string;
+			leftLabel?: string;
+			rightLabel?: string;
+			lineStyle?: 'solid' | 'dashed' | 'none';
+		},
+		doc: Document
+	): HTMLElement {
+		const wrapper = doc.createElement('span');
+		wrapper.className = 'obsidian-proof-tree-node';
+		wrapper.style.cssText = 'display:inline-flex;flex-direction:column;align-items:stretch;justify-content:center;vertical-align:middle;max-width:100%;margin:0.25em auto;';
+
+		if (node.premises.length > 0) {
+			const premises = doc.createElement('span');
+			premises.style.cssText = 'display:flex;align-items:flex-end;justify-content:center;gap:1rem;';
+			for (const premise of node.premises) {
+				premises.appendChild(this.renderProofTreeNode(premise, doc));
+			}
+			wrapper.appendChild(premises);
+
+			if (node.lineStyle !== 'none') {
+				const rule = doc.createElement('span');
+				rule.style.cssText = 'display:flex;align-items:center;gap:0.5rem;margin:0.15em 0;';
+
+				if (node.leftLabel) {
+					const left = doc.createElement('span');
+					left.textContent = node.leftLabel;
+					left.style.cssText = 'font-size:0.8em;white-space:nowrap;';
+					rule.appendChild(left);
+				}
+
+				const bar = doc.createElement('span');
+				bar.style.cssText = `flex:1;border-top:${node.lineStyle === 'dashed' ? '2px dashed' : '2px solid'} currentColor;min-width:2.5rem;`;
+				rule.appendChild(bar);
+
+				if (node.rightLabel) {
+					const right = doc.createElement('span');
+					right.textContent = node.rightLabel;
+					right.style.cssText = 'font-size:0.8em;white-space:nowrap;';
+					rule.appendChild(right);
+				}
+
+				wrapper.appendChild(rule);
+			}
+		}
+
+		const conclusion = doc.createElement('span');
+		conclusion.textContent = node.conclusion;
+		conclusion.style.cssText = 'display:block;text-align:center;white-space:nowrap;padding:0 0.35em;';
+		wrapper.appendChild(conclusion);
+
+		return wrapper;
+	}
+
+	private static renderStandaloneBussproofs(article: HTMLElement, doc: Document): number {
+		const walker = doc.createTreeWalker(article, NodeFilter.SHOW_TEXT);
+		const textNodes: Text[] = [];
+		let node: Node | null;
+		while ((node = walker.nextNode())) {
+			if (node.parentElement?.closest('pre, code, mjx-container, .obsidian-proof-tree')) continue;
+			textNodes.push(node as Text);
+		}
+
+		// Match display math blocks \[...\] that contain prooftrees (may have
+		// multiple trees with \hspace/\quad between them), inline \(...\)
+		// wrapping a single tree, or bare prooftree environments.
+		const displayBlockPattern = /\\\[[\s\S]*?\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\}[\s\S]*?\\\]/g;
+		const singlePattern = /\\\(\s*(\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\})\s*\\\)|(\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\})/g;
+		const treeExtract = /\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\}/g;
+		let renderedCount = 0;
+
+		for (const textNode of textNodes) {
+			const source = textNode.data;
+			if (!source.includes('\\begin{prooftree}')) continue;
+
+			const fragment = doc.createDocumentFragment();
+			let lastIndex = 0;
+			let renderedInNode = 0;
+
+			// Collect all matches (display blocks and single trees) with positions
+			type ProofMatch = { start: number; end: number; trees: string[] };
+			const matches: ProofMatch[] = [];
+
+			// First pass: display math blocks containing prooftrees.
+			// Only consume a block if ALL trees inside it can be parsed;
+			// otherwise leave the whole block for MathJax.
+			// Track all display block ranges so the second pass doesn't
+			// consume individual trees inside them.
+			type DisplayRange = { start: number; end: number };
+			const displayRanges: DisplayRange[] = [];
+			displayBlockPattern.lastIndex = 0;
+			let m: RegExpExecArray | null;
+			while ((m = displayBlockPattern.exec(source))) {
+				const range = { start: m.index, end: m.index + m[0].length };
+				displayRanges.push(range);
+				const inner = m[0];
+				const trees: string[] = [];
+				treeExtract.lastIndex = 0;
+				let tm: RegExpExecArray | null;
+				while ((tm = treeExtract.exec(inner))) {
+					trees.push(tm[0]);
+				}
+				if (trees.length === 0) continue;
+				const parseResults = trees.map(t => ({ parseable: this.parseProofTree(t) !== null, sample: t.slice(0, 80) }));
+				const allParseable = parseResults.every(r => r.parseable);
+				if (allParseable) {
+					matches.push({ ...range, trees });
+				}
+			}
+
+			// Second pass: inline/bare prooftrees not inside any display block
+			singlePattern.lastIndex = 0;
+			while ((m = singlePattern.exec(source))) {
+				const inDisplay = displayRanges.some(r => m!.index >= r.start && m!.index < r.end);
+				if (inDisplay) continue;
+				const inMatch = matches.some(pm => m!.index >= pm.start && m!.index < pm.end);
+				if (inMatch) continue;
+				const latex = m[1] || m[2];
+				if (!this.parseProofTree(latex)) continue;
+				matches.push({ start: m.index, end: m.index + m[0].length, trees: [latex] });
+			}
+
+			matches.sort((a, b) => a.start - b.start);
+
+			for (const pm of matches) {
+				const rendered: HTMLElement[] = [];
+				for (const tree of pm.trees) {
+					const parsed = this.parseProofTree(tree);
+					if (parsed) rendered.push(this.renderProofTreeNode(parsed, doc));
+				}
+				if (rendered.length === 0) continue;
+
+				if (pm.start > lastIndex) {
+					fragment.appendChild(doc.createTextNode(source.slice(lastIndex, pm.start)));
+				}
+
+				const container = doc.createElement('span');
+				container.className = 'obsidian-proof-tree';
+				if (rendered.length > 1) {
+					// Multiple trees: lay out side by side
+					container.style.cssText = 'display:flex;flex-wrap:wrap;justify-content:center;gap:2em;margin:0.75em 0;';
+					for (const el of rendered) container.appendChild(el);
+				} else {
+					container.style.cssText = 'display:block;overflow-x:auto;margin:0.75em 0;text-align:center;';
+					container.appendChild(rendered[0]);
+				}
+				fragment.appendChild(container);
+				renderedCount += rendered.length;
+				renderedInNode += rendered.length;
+				lastIndex = pm.end;
+			}
+
+			if (renderedInNode === 0) continue;
+			if (lastIndex < source.length) {
+				fragment.appendChild(doc.createTextNode(source.slice(lastIndex)));
+			}
+			textNode.replaceWith(fragment);
+		}
+
+		return renderedCount;
 	}
 
 	private static fallbackRenderMath(article: HTMLElement, doc: Document): number {
@@ -2707,6 +3096,11 @@ export class Reader {
 		const text = article.textContent || '';
 		if (!text.includes('\\(') && !text.includes('\\[')) return;
 
+		// Render standalone bussproofs trees ahead of MathJax. The raw source
+		// often nests math delimiters inside prooftree nodes, which the page-level
+		// scanner doesn't reliably typeset.
+		this.renderStandaloneBussproofs(article as HTMLElement, doc);
+
 		// Load page-specific MathJax macros
 		const macroAttr = doc.documentElement.getAttribute('data-math-macros');
 		let macros: Record<string, string | [string, number]> = {};
@@ -2740,6 +3134,7 @@ export class Reader {
 			tex: {
 				inlineMath: [['\\(', '\\)']],
 				displayMath: [['\\[', '\\]']],
+				packages: { '[+]': ['bussproofs'] },
 				macros,
 			},
 			svg: { fontCache: 'local' },

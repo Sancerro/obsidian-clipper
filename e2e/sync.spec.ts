@@ -1774,6 +1774,7 @@ test('math: bussproofs prooftrees render in reader mode', async ({
 		// multiple nested SVG groups containing <line> or <rect> elements.
 		const allMjx = article.querySelectorAll('mjx-container');
 		let prooftreeCount = 0;
+		const customProofTreeCount = article.querySelectorAll('.obsidian-proof-tree').length;
 		let prooftreeErrors = 0;
 		let sample = '';
 		for (const el of allMjx) {
@@ -1794,26 +1795,31 @@ test('math: bussproofs prooftrees render in reader mode', async ({
 			}
 		}
 
-		// Also check the text content for raw \begin{prooftree} that wasn't rendered
-		const text = article.textContent || '';
-		const rawProoftrees = (text.match(/\\begin\{prooftree\}/g) || []).length;
+		const modusPonens = Array.from(article.querySelectorAll('li')).find(el =>
+			(el.textContent || '').includes('modus ponens')
+		);
+		const modusText = modusPonens?.textContent || '';
+		const modusHasRaw = modusText.includes('\\begin{prooftree}');
+		const modusRendered = !!modusPonens?.querySelector('mjx-container svg, .obsidian-proof-tree');
 
-		// Context around first raw prooftree
-		let contextAroundFirst = '';
-		const idx = text.indexOf('\\begin{prooftree}');
-		if (idx >= 0) contextAroundFirst = text.slice(Math.max(0, idx - 50), idx + 60).replace(/\n/g, '↵');
-
-		return { prooftreeCount, prooftreeErrors, rawProoftrees, sample, contextAroundFirst };
+		return {
+			prooftreeCount,
+			customProofTreeCount,
+			prooftreeErrors,
+			sample,
+			modusHasRaw,
+			modusRendered,
+			modusText
+		};
 	});
 
-	// Either prooftrees render as SVG structures or there are no raw unrendered prooftrees
 	expect(check.prooftreeErrors, `prooftree errors: ${check.sample}`).toBe(0);
-	// Display math \[...\] between paragraphs containing prooftrees should be
-	// wrapped and preserved during extraction. Allow 0 raw prooftrees.
-	// Reader mode renders all prooftrees via MathJax. The markdown clip may
-	// have some raw prooftrees from display-math blocks that span elements,
-	// but the majority should be processed.
-	expect(check.prooftreeErrors, `prooftree errors: ${check.sample}`).toBe(0);
+	expect(check.modusHasRaw, `modus ponens still raw: ${check.modusText.slice(0, 160)}`).toBe(false);
+	expect(check.modusRendered, 'modus ponens proof tree should render').toBe(true);
+	expect(
+		check.prooftreeCount + check.customProofTreeCount,
+		'expected bussproofs trees to render as MathJax SVG or custom proof-tree HTML blocks'
+	).toBeGreaterThan(0);
 });
 
 // MathML elements with data-latex attributes (e.g. Wikipedia) should be

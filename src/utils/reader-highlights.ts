@@ -6,8 +6,10 @@
 import browser from './browser-polyfill';
 import { getPluginErrorMessage, pluginFetch } from './plugin-url';
 import { logHandledError } from './error-utils';
+import { renderMacroDefsForObsidian } from './obsidian-math-macros';
 import Defuddle from 'defuddle';
 import { createMarkdownContent as defuddleToMarkdown, wrapRawLatexDelimiters } from 'defuddle/full';
+import { normalizeProoftreesForObsidian } from './prooftree-markdown';
 
 // ── Types ────────────────────────────────────────────────
 
@@ -437,20 +439,22 @@ export async function autoClipPage(url: string): Promise<void> {
 			title = rawTitle;
 			const rawHtml = article.getAttribute('data-pre-mathjax-html') || article.innerHTML;
 			const tempDoc = new DOMParser().parseFromString(`<article>${rawHtml}</article>`, 'text/html');
+			const macroAttrVal = document.documentElement.getAttribute('data-math-macros');
+			if (macroAttrVal) tempDoc.documentElement.setAttribute('data-math-macros', macroAttrVal);
 			const tempArt = tempDoc.querySelector('article');
 			if (tempArt) wrapRawLatexDelimiters(tempArt, tempDoc);
-			markdown = defuddleToMarkdown(tempArt?.innerHTML || rawHtml, cleanUrl);
+			const clipHtml = tempArt?.innerHTML || rawHtml;
+			let clipMacros: Record<string, string | [string, number]> | undefined;
+			if (macroAttrVal) { try { clipMacros = JSON.parse(macroAttrVal); } catch {} }
+			markdown = defuddleToMarkdown(clipHtml, cleanUrl, { macros: clipMacros });
+			markdown = normalizeProoftreesForObsidian(markdown);
 
 			// Prepend \newcommand definitions for page-specific macros
 			const macroAttr = document.documentElement.getAttribute('data-math-macros');
 			if (macroAttr) {
 				try {
 					const macros = JSON.parse(macroAttr) as Record<string, string | [string, number]>;
-					const defs = Object.entries(macros).map(([name, val]) => {
-						const n = name.startsWith('\\') ? name : `\\${name}`;
-						if (Array.isArray(val)) return `\\newcommand{${n}}[${val[1]}]{${val[0]}}`;
-						return `\\newcommand{${n}}{${val}}`;
-					}).join('\n');
+					const defs = renderMacroDefsForObsidian(macros);
 					if (defs) markdown = `$$\n${defs}\n$$\n\n${markdown}`;
 				} catch {}
 			}

@@ -54,24 +54,34 @@ async function extractMathJaxMacrosFromTab(tabId: number): Promise<MathJaxMacroM
 		world: 'MAIN',
 		func: () => {
 			const mathJax = (window as Window & { MathJax?: any }).MathJax;
+			const liveMacros =
+				mathJax?.startup?.document?.inputJax?.[0]?.parseOptions?.options?.macros
+				|| mathJax?.startup?.input?.[0]?.parseOptions?.options?.macros
+				|| mathJax?.startup?.getComponents?.()?.input?.[0]?.parseOptions?.options?.macros
+				|| {};
 			const raw =
 				mathJax?.config?.tex?.macros
 				|| mathJax?.tex?.macros
 				|| mathJax?.config?.TeX?.Macros
+				|| liveMacros
 				|| {};
 
 			if (!raw || typeof raw !== 'object') return {};
 
+			const sources = [raw, liveMacros];
 			const macros: Record<string, string | [string, number]> = {};
-			for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
-				if (typeof value === 'string') {
-					macros[name] = value;
-					continue;
-				}
+			for (const source of sources) {
+				if (!source || typeof source !== 'object') continue;
+				for (const [name, value] of Object.entries(source as Record<string, unknown>)) {
+					if (typeof value === 'string') {
+						macros[name] = value;
+						continue;
+					}
 
-				if (Array.isArray(value) && typeof value[0] === 'string') {
-					const argc = typeof value[1] === 'number' ? value[1] : Number(value[1]);
-					macros[name] = Number.isFinite(argc) ? [value[0], argc] : value[0];
+					if (Array.isArray(value) && typeof value[0] === 'string') {
+						const argc = typeof value[1] === 'number' ? value[1] : Number(value[1]);
+						macros[name] = Number.isFinite(argc) ? [value[0], argc] : value[0];
+					}
 				}
 			}
 

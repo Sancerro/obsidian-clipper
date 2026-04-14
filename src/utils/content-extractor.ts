@@ -1,5 +1,6 @@
 import { ExtractedContent } from '../types/types';
 import { createMarkdownContent } from 'defuddle/full';
+import { normalizeProoftreesForObsidian } from './prooftree-markdown';
 import { sanitizeFileName } from './string-utils';
 import { buildVariables, addSchemaOrgDataToVariables } from './shared';
 import browser from './browser-polyfill';
@@ -140,7 +141,7 @@ export async function initializePageContent(
 		let selectedMarkdown = '';
 		if (selectedHtml) {
 			content = selectedHtml;
-			selectedMarkdown = createMarkdownContent(selectedHtml, currentUrl);
+			selectedMarkdown = normalizeProoftreesForObsidian(createMarkdownContent(selectedHtml, currentUrl));
 		}
 
 		// Process highlights after getting the base content
@@ -148,7 +149,7 @@ export async function initializePageContent(
 			content = processHighlights(content, highlights);
 		}
 
-		const markdownBody = createMarkdownContent(content, currentUrl);
+		const markdownBody = normalizeProoftreesForObsidian(createMarkdownContent(content, currentUrl));
 
 		// Convert each highlight to markdown individually
 		const highlightsData = highlights.map(highlight => {
@@ -157,7 +158,7 @@ export async function initializePageContent(
 				timestamp: string;
 				notes?: string[];
 			} = {
-				text: createMarkdownContent(highlight.content, currentUrl),
+				text: normalizeProoftreesForObsidian(createMarkdownContent(highlight.content, currentUrl)),
 				timestamp: dayjs(parseInt(highlight.id)).toISOString(),
 			};
 
