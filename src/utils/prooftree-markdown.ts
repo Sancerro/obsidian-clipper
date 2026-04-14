@@ -9,6 +9,17 @@ const PROOFTREE_COMMANDS = new Set([
 	'LeftLabel',
 ]);
 
+// Non-C bussproofs inference commands (without trailing "C").
+// MathJax expects these with $...$ arguments, not {...}.
+const NON_C_INFERENCE_COMMANDS = new Set([
+	'Axiom',
+	'UnaryInf',
+	'BinaryInf',
+	'TrinaryInf',
+	'QuaternaryInf',
+	'QuinaryInf',
+]);
+
 function extractBraceArgument(source: string, openBraceIndex: number): { value: string; endIndex: number } | null {
 	if (source[openBraceIndex] !== '{') return null;
 
@@ -84,15 +95,97 @@ function normalizeProoftreeCommandArguments(block: string): string {
 	return result;
 }
 
+/**
+ * Detect whether a prooftree block uses non-C bussproofs syntax.
+ * A block is non-C if it contains commands like \Axiom, \UnaryInf, etc.
+ * (without the trailing "C") followed by a brace argument.
+ */
+function blockUsesNonCSyntax(block: string): boolean {
+	for (const cmd of NON_C_INFERENCE_COMMANDS) {
+		// Match \Axiom{ but not \AxiomC{ — the command must not be followed by "C"
+		const pattern = new RegExp(`\\\\${cmd}\\s*\\{`);
+		if (pattern.test(block)) return true;
+	}
+	return false;
+}
+
+/**
+ * Convert non-C inference commands from \Axiom{...} back to \Axiom$...$
+ * and wrap label content in $...$ for MathJax compatibility.
+ * Only applied to blocks that use non-C syntax.
+ */
+function restoreNonCSyntax(block: string): string {
+	if (!blockUsesNonCSyntax(block)) return block;
+
+	let result = '';
+
+	for (let i = 0; i < block.length;) {
+		if (block[i] !== '\\') {
+			result += block[i];
+			i += 1;
+			continue;
+		}
+
+		const match = block.slice(i).match(/^\\([A-Za-z]+)/);
+		if (!match) {
+			result += block[i];
+			i += 1;
+			continue;
+		}
+
+		const command = match[1];
+
+		// Non-C inference commands: \Axiom{...} → \Axiom$...$
+		if (NON_C_INFERENCE_COMMANDS.has(command)) {
+			let j = i + command.length + 1;
+			while (/\s/.test(block[j] || '')) j += 1;
+			const arg = extractBraceArgument(block, j);
+			if (arg) {
+				result += `\\${command}$${arg.value}$`;
+				i = arg.endIndex;
+			} else {
+				result += `\\${command}`;
+				i += command.length + 1;
+			}
+			continue;
+		}
+
+		// Labels in non-C blocks: \RightLabel{...} → \RightLabel{$...$}
+		if (command === 'RightLabel' || command === 'LeftLabel') {
+			let j = i + command.length + 1;
+			while (/\s/.test(block[j] || '')) j += 1;
+			const arg = extractBraceArgument(block, j);
+			if (arg) {
+				result += `\\${command}{$${arg.value}$}`;
+				i = arg.endIndex;
+			} else {
+				result += `\\${command}`;
+				i += command.length + 1;
+			}
+			continue;
+		}
+
+		result += `\\${command}`;
+		i += command.length + 1;
+	}
+
+	return result;
+}
+
 function normalizeProoftreeLatex(latex: string): string {
 	if (!latex.includes('\\begin{prooftree}')) return latex;
 
 	return latex.replace(/\\begin\{prooftree\}[\s\S]*?\\end\{prooftree\}/g, block => (
-		normalizeProoftreeCommandArguments(
-			block
-			.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
-			.replace(/\\\[([\s\S]*?)\\\]/g, '$1')
-			.replace(/\$([^$]+?)\$/g, '$1')
+		restoreNonCSyntax(
+			normalizeProoftreeCommandArguments(
+				block
+				.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
+				.replace(/\\\[([\s\S]*?)\\\]/g, '$1')
+				// Convert non-C \Axiom$...$  →  \Axiom{...} before generic $ stripping
+				.replace(/\\(Axiom|UnaryInf|BinaryInf|TrinaryInf|QuaternaryInf|QuinaryInf)\$([^$]*)\$/g,
+					(_m, cmd, arg) => `\\${cmd}{${arg}}`)
+				.replace(/\$([^$]+?)\$/g, '$1')
+			)
 		)
 	));
 }

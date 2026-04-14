@@ -69,4 +69,64 @@ $$`;
 		const input = String.raw`Euler: $e^{i\pi}+1=0$`;
 		expect(normalizeProoftreesForObsidian(input)).toBe(input);
 	});
+
+	test('restores non-C bussproofs commands from {…} to $…$ syntax', () => {
+		// After defuddle converts \Axiom$...$  →  \Axiom{...},
+		// the clip output must convert back to $...$ for MathJax.
+		const input = String.raw`$$
+\begin{prooftree}
+\def\fCenter{\Lrightarrow}
+\Axiom{\Gamma\fCenter \Theta, \rA}
+\RightLabel{\neg\text{(R)}}
+\UnaryInf{\Gamma\fCenter \Theta, \neg\rA}
+\end{prooftree}
+$$`;
+		const output = normalizeProoftreesForObsidian(input);
+
+		// Non-C inference commands get $...$ arguments
+		expect(output).toContain(String.raw`\Axiom$\Gamma\fCenter \Theta, \rA$`);
+		expect(output).toContain(String.raw`\UnaryInf$\Gamma\fCenter \Theta, \neg\rA$`);
+		// Labels get $...$ wrapping inside {...}
+		expect(output).toContain(String.raw`\RightLabel{$\neg\text{(R)}$}`);
+		// Must NOT contain brace-wrapped non-C commands
+		expect(output).not.toContain(String.raw`\Axiom{`);
+		expect(output).not.toContain(String.raw`\UnaryInf{`);
+	});
+
+	test('keeps C-variant commands with {…} syntax unchanged', () => {
+		const input = String.raw`$$
+\begin{prooftree}
+\AxiomC{\rA\supset\rB}
+\AxiomC{\rA}
+\BinaryInfC{\rB}
+\end{prooftree}
+$$`;
+		const output = normalizeProoftreesForObsidian(input);
+
+		// C-variant commands keep {...} syntax
+		expect(output).toContain(String.raw`\AxiomC{\rA\supset\rB}`);
+		expect(output).toContain(String.raw`\AxiomC{\rA}`);
+		expect(output).toContain(String.raw`\BinaryInfC{\rB}`);
+		// Must NOT have $...$ syntax on C-variant commands
+		expect(output).not.toContain(String.raw`\AxiomC$`);
+		expect(output).not.toContain(String.raw`\BinaryInfC$`);
+	});
+
+	test('handles BinaryInf non-C command correctly', () => {
+		const input = String.raw`$$
+\begin{prooftree}
+\def\fCenter{\Lrightarrow}
+\Axiom{\Gamma\fCenter \Theta, \rA}
+\Axiom{\rB, \Gamma\fCenter \Theta}
+\RightLabel{\supset\text{(L)}}
+\BinaryInf{\rA \supset \rB, \Gamma\fCenter \Theta}
+\end{prooftree}
+$$`;
+		const output = normalizeProoftreesForObsidian(input);
+
+		expect(output).toContain(String.raw`\Axiom$\Gamma\fCenter \Theta, \rA$`);
+		expect(output).toContain(String.raw`\Axiom$\rB, \Gamma\fCenter \Theta$`);
+		expect(output).toContain(String.raw`\BinaryInf$\rA \supset \rB, \Gamma\fCenter \Theta$`);
+		expect(output).toContain(String.raw`\RightLabel{$\supset\text{(L)}$}`);
+	});
 });
