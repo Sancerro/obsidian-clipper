@@ -25,4 +25,17 @@ describe('normalizeMacrosForObsidian', () => {
 		expect(defs).toContain(String.raw`\newcommand{\turnstile}[1]{\mathrel{\vdash_{#1}}}`);
 		expect(defs).toContain(String.raw`\newcommand{\CPC}{\text{CPC}}`);
 	});
+
+	test('does not emit duplicate definitions for backslash-prefixed keys', () => {
+		const defs = renderMacroDefsForObsidian({
+			'\\turnstile': ['bad-complex', 1],
+			'\\CPC': '\\text{CPC}',
+		});
+
+		// Should have exactly one \turnstile definition (the normalized one)
+		const turnstileCount = (defs.match(/\\newcommand\{\\turnstile\}/g) || []).length;
+		expect(turnstileCount).toBe(1);
+		expect(defs).toContain(String.raw`\newcommand{\turnstile}[1]{\mathrel{\vdash_{#1}}}`);
+		expect(defs).not.toContain('bad-complex');
+	});
 });
