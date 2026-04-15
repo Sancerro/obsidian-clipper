@@ -181,8 +181,16 @@ function openHighlightSSE(session: HighlightSSESession): void {
 			// Tell content script to do a catch-up fetch now that we're subscribed
 			try { session.port.postMessage({ action: 'pageHighlightsChanged' }); } catch { /* port closed */ }
 		};
-		es.onmessage = () => {
-			try { session.port.postMessage({ action: 'pageHighlightsChanged' }); } catch { /* port closed */ }
+		es.onmessage = (event) => {
+			let payload: Record<string, unknown> = {};
+			try { payload = JSON.parse(event.data); } catch { /* not JSON */ }
+			try {
+				if (payload.type === 'progress') {
+					session.port.postMessage({ action: 'progressChanged', progress: payload.progress });
+				} else {
+					session.port.postMessage({ action: 'pageHighlightsChanged' });
+				}
+			} catch { /* port closed */ }
 		};
 		es.onerror = () => {
 			es.close();

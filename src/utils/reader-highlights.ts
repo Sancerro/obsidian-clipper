@@ -1019,7 +1019,11 @@ export interface HighlightSync {
 }
 
 /** Subscribe to highlight changes for a URL via background SSE. Callback fires on change. */
-export function subscribeHighlightChanges(url: string, onChange: () => void): HighlightSync {
+export function subscribeHighlightChanges(
+	url: string,
+	onChange: () => void,
+	onProgressChanged?: (progress: string[]) => void,
+): HighlightSync {
 	let port: browser.Runtime.Port | null = null;
 	let currentUrl = url;
 
@@ -1027,7 +1031,12 @@ export function subscribeHighlightChanges(url: string, onChange: () => void): Hi
 		try {
 			port = browser.runtime.connect({ name: 'highlight-sse' });
 			port.onMessage.addListener((msg: unknown) => {
-				if ((msg as any)?.action === 'pageHighlightsChanged') onChange();
+				const m = msg as { action?: string; progress?: string[] };
+				if (m?.action === 'progressChanged' && onProgressChanged) {
+					onProgressChanged(Array.isArray(m.progress) ? m.progress : []);
+				} else if (m?.action === 'pageHighlightsChanged') {
+					onChange();
+				}
 			});
 			port.onDisconnect.addListener(() => { port = null; });
 			port.postMessage({ action: 'subscribe', url: subUrl });

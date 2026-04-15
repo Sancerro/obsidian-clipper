@@ -10,6 +10,7 @@ import { AsyncResolver, RenderContext } from './utils/renderer';
 import { applyFilters } from './utils/filters';
 import { buildVariables, generateFrontmatter, extractContentBySelector, selectorContentToString, formatPropertyValue } from './utils/shared';
 import { sanitizeFileName } from './utils/string-utils';
+import { contentHash } from './utils/content-hash';
 import { Template, Property } from './types/types';
 
 // ---------------------------------------------------------------------------
@@ -239,6 +240,12 @@ export async function clip(options: ClipOptions): Promise<ClipResult> {
 	}
 	if (propertyTypes) {
 		Object.assign(typeMap, propertyTypes);
+	}
+
+	// Append source-hash for change detection on revisit
+	const hash = contentHash(markdownContent);
+	if (!compiledProperties.some(p => p.name === 'source-hash')) {
+		compiledProperties.push({ name: 'source-hash', value: hash, type: 'text' });
 	}
 
 	// Generate frontmatter

@@ -1,5 +1,175 @@
 # Progress Log: Bidirectional Highlight Sync
 
+## 2026-04-15 (session 6)
+
+### Goal
+Multiple reader mode fixes: code blocks, quote spacing, outline improvements, content extraction.
+
+### Bug 1: Java code blocks disappear in reader mode
+- Page: https://dev.java/learn/annotations/
+- Root cause: `<java-playground>` custom elements store code in HTML comments (`<!--...-->`) inside `<snippet>` children. No text content → heuristic scorer removes them.
+- Fix: added `convertCodePlaygrounds()` pre-processing method in `defuddle.ts` that runs before removals. Extracts code from Comment nodes and replaces with `<pre><code class="language-java">`.
+
+### Bug 2: Spurious spaces around quoted inline elements
+- Symptom: `"<b>carrier hotel</b>"` renders as `" **carrier hotel** "`
+- Root cause: Defuddle's inline element spacing logic in `standardize.ts` didn't include `"` or other quotation marks in punctuation regex patterns.
+- Fix: added `"`, `"`, `»`, `'`, `'`, `«` to `nextStartsWithPunctuation` and `currentEndsWithPunctuation` regexes. Updated 4 expected test fixtures.
+
+### Bug 3: "See also" section stripped from Wikipedia
+- Page: https://en.wikipedia.org/wiki/Net_(economics)
+- Root cause: `RELATED_HEADING_PATTERN` in `content-patterns.ts` matched "see also" and removed it as a "related posts" section. This cascaded: removed "See also" + trailing content, `removeThinPrecedingSection` ate the Grammatical usage paragraph, `removeTrailingHeadings` removed the orphaned heading.
+- Fix: removed "see also" from `RELATED_HEADING_PATTERN`. Unlike "related posts", "see also" is curated editorial content on reference/documentation sites.
+
+### Bug 4: Footnotes appear after succeeding headings (wrong position)
+- Symptom: on Wikipedia pages with "References" followed by "External links", footnotes were placed after "External links"
+- Root cause: `standardizeFootnotes` always appended `#footnotes` at the very end of the content element, ignoring the original position of the footnote list.
+- Fix: find the last footnote heading (matching "References"/"Notes"/"Footnotes"/etc.) before removing footnote lists, then insert the standardized `#footnotes` section right after that heading instead of at the end. Also clean up orphaned elements (empty wrappers, style tags) between the heading and next heading.
+
+### Feature: "Introduction" outline entry for pre-heading content
+- Added "Introduction" checkbox to outline when article has content before the first h2+ heading
+- Title click now toggles Introduction completion
+- Introduction participates in progress bar/label counts
+- Title item never gets "faint" class (always visible in outline)
+
+### Feature: Independent checkboxes for parent headings with own content
+- Added `hasOwnContent` flag to `HeadingInfo` interface
+- Parent headings with prose between them and their first child heading now toggle independently (not cascaded to children, not auto-derived from children)
+- `recomputeParentProgress` skips `hasOwnContent` parents
+- `toggleHeadingProgress` treats `hasOwnContent` parents like leaves
+- Added 5 new tests for `hasOwnContent` behavior
+
+### Files changed
+- `../defuddle/src/defuddle.ts` — `convertCodePlaygrounds()` method + pipeline call
+- `../defuddle/src/standardize.ts` — quote chars in spacing regexes
+- `../defuddle/src/removals/content-patterns.ts` — removed "see also" from `RELATED_HEADING_PATTERN`
+- `../defuddle/src/elements/footnotes.ts` — insert footnotes after heading, cleanup orphaned elements
+- `src/utils/reading-progress.ts` — `hasOwnContent` flag, independent toggle/recompute logic
+- `src/utils/reading-progress.test.ts` — 5 new tests for `hasOwnContent` behavior
+- `src/utils/reader.ts` — Introduction outline entry, `hasIntroContent()`, `headingHasOwnContent()`, title-toggles-intro, title never faint, `formatProgressLabel`/`computeProgressWidth` refactored to use HeadingInfo
+
+---
+
+## 2026-04-14 (session 5)
+
+### Goal
+Fix sidebar section completion: parent heading checkboxes not toggleable when all descendants are already checked.
+
+### Bug analysis
+- Page: https://nutritionsource.hsph.harvard.edu/carbohydrates/fiber/
+- Symptom: clicking "Types of Fiber" checkbox does nothing; "Further defining fiber" (child) works fine
+- Root cause: multiple interacting issues in reading-progress.ts:
+  1. `recomputeParentProgress` used `buildHierarchy` which only finds direct children at `parent.level + 1` — fails when content extractors create heading level gaps (e.g. h2 → h4 with no h3)
+  2. `toggleHeadingProgress` check branch relied solely on `recomputeParentProgress` to add parent — if recompute failed, clicking parent when all children done = no-op
+  3. `fetchReadingProgress` and SSE handler never called `recomputeParentProgress` — stale stored progress with missing parents never recovered
+
+### Fixes applied
+1. **`recomputeParentProgress`**: switched from `buildHierarchy` (direct children only) to `getDescendants` (all descendants). Handles level gaps and is semantically equivalent for sequential levels thanks to bottom-up processing.
+2. **`toggleHeadingProgress`**: check branch now explicitly adds parent to progress (belt-and-suspenders, doesn't rely solely on recompute).
+3. **`reader.ts`**: added `recomputeParentProgress` call after `fetchReadingProgress` and in SSE progress update handler.
+4. **Tests**: added `GAP_HEADINGS` fixture (h2 → h4 gap) and 9 new tests covering level-gap recompute, toggle, and the "all descendants already done" click scenario.
+
+### Files changed
+- `src/utils/reading-progress.ts` — recomputeParentProgress + toggleHeadingProgress fixes
+- `src/utils/reading-progress.test.ts` — 9 new test cases
+- `src/utils/reader.ts` — recompute after fetch + SSE handler
+
+### Bug 2: `<summary>` cursor not pointer
+- Collapsible `<details>/<summary>` elements (e.g. "What is hypoglycemia?" on Harvard nutrition pages) don't show pointer cursor on hover in reader mode
+- Fix: added CSS rule `.obsidian-reader-active article summary { cursor: pointer; }` in `src/reader.scss`
+
+### Bug 3: plant-based milk content missing in reader mode
+- Page: https://nutritionsource.hsph.harvard.edu/milk/
+- Symptom: paragraph + nutrition table under "What about plant-based milk?" heading disappears in reader mode
+- Root cause: the content is inside `<div class="card-text">` (Bootstrap card component). Defuddle's `PARTIAL_SELECTORS` in `constants.ts:415` includes `'card-text'` as a non-content pattern, so the entire div (paragraph + table) gets stripped. The heading survives because it's in a sibling element (`h4.card-title`).
+- Fix: commented out `card-text` from PARTIAL_SELECTORS. It's too generic — Bootstrap uses it for any text content inside cards. The dedicated `isCardGrid` heuristic (3+ headings, 2+ images, low prose) independently catches actual card grids.
+- Changed file: `../defuddle/src/constants.ts` line 415
+
+### Bug 4: Spurious spaces around quoted inline elements
+- Symptom: text like `"<b>carrier hotel</b>"` renders as `" **carrier hotel** "` with extra spaces between quotes and bold text
+- Root cause: Defuddle's inline element spacing logic in `standardize.ts` (lines 1042-1043) adds spaces between adjacent elements/text nodes unless punctuation is detected. The regex patterns didn't include `"` (double quote) or other quotation marks.
+- Fix: added `"`, `"` (U+201D), `»` to `nextStartsWithPunctuation` regex; added `"`, `'`, `"` (U+201C), `'` (U+2018), `«` to `currentEndsWithPunctuation` regex
+- Changed file: `../defuddle/src/standardize.ts` — quote characters in spacing regexes
+- Updated 4 expected test fixtures (wikipedia, lesswrong, wp-block-footnotes, maggieappleton) — all diffs confirmed correct (removed spurious spaces)
+
+### Bug 5: Java code blocks disappear in reader mode
+- Page: https://dev.java/learn/annotations/
+- Symptom: all code blocks disappear in reader mode; only surrounding prose text remains
+- Root cause: dev.java uses custom `<java-playground>` web components. The actual source code is stored inside HTML comments (`<!-- ... -->`) within `<snippet>` child elements. These custom elements have no text content visible to the DOM, so Defuddle's heuristic scorer discards them as empty non-content blocks before the code block standardization rules even run.
+- Fix: added `convertCodePlaygrounds` pre-processing step in `defuddle.ts` that runs early in the pipeline (right after shadow DOM flattening, before any removals). It finds `<java-playground>` elements, extracts code from Comment nodes inside `<snippet>` children, and replaces the whole element with `<pre><code class="language-java">`.
+- Changed file: `../defuddle/src/defuddle.ts` — new `convertCodePlaygrounds()` method + call in pipeline
+
+---
+
+## 2026-04-14 (session 4)
+
+### Goal
+Integrate paper-reading-tracker's floating outline + reading progress into reading-selection-highlight plugin and the clipper's reader mode. Make the standalone paper-reading-tracker plugin redundant.
+
+### Architecture
+- **reading-selection-highlight plugin** absorbs the outline UI and progress tracking
+- **Clipper reader mode** gets checkboxes + progress bar in the existing left sidebar outline
+- Both surfaces sync reading progress bidirectionally via HTTP (:27124) using the same protocol as highlights
+- Progress stored in note frontmatter as `reading-progress: [...]` (same format as paper-reading-tracker)
+- SSE stream extended with `type` field: `"highlights"` vs `"progress"` to distinguish event types
+
+### Changes
+
+#### Plugin: reading-selection-highlight (`/Users/baris/obsidian-plugin-repos/reading-selection-highlight`)
+
+##### New files
+- **`src/outline/OutlineView.ts`** — Ported outline UI from paper-reading-tracker as a self-contained class
+  - Shows floating ToC for any note with 2+ h2/h3 headings in preview mode
+  - Progress checkboxes only appear when note has `source` frontmatter (i.e. clipped page)
+  - Scroll spy, SVG tree line, accent dot, click-to-navigate, heading click-to-toggle
+  - Notifies plugin via `OutlineCallbacks.onProgressChanged` after frontmatter write
+  - `handleExternalProgressUpdate(notePath)` for browser→Obsidian sync
+- **`src/outline/outlineStyles.ts`** — CSS for the outline panel (ported from paper-reading-tracker styles.css)
+
+##### Modified files
+- **`src/main.ts`**:
+  - Imports OutlineView + OUTLINE_CSS
+  - Creates `outlineView` instance on layout ready, wires `onProgressChanged` callback to SSE notification
+  - `scheduleRefresh` also triggers `outlineView.scheduleRefresh()`
+  - `onunload` calls `outlineView.uninstall()`
+  - `injectStyles` appends OUTLINE_CSS to the style element
+  - New method: `notifySseProgressChanged(notePath, progress)` — sends typed SSE message to matching clients
+  - `notifySseClients` now includes `type: "highlights"` in payload for consistency
+  - New endpoint: `GET /progress?url=` — returns reading-progress array from note frontmatter
+  - New endpoint: `POST /progress/set` — writes progress to note frontmatter, notifies SSE + outline
+  - New handlers: `handleGetProgress()`, `handleSetProgress()`
+
+#### Extension: obsidian-clipper (`/Users/baris/Desktop/obsidian-clipper`)
+
+##### Modified files
+- **`src/background.ts`**: SSE `onmessage` now parses JSON payload, forwards `progressChanged` action with progress array for `type: "progress"` events
+- **`src/utils/reader-highlights.ts`**: `subscribeHighlightChanges` accepts optional `onProgressChanged` callback, dispatches based on `msg.action`
+- **`src/utils/reader.ts`**:
+  - New static fields: `readingProgress`, `outlineProgressUpdate`
+  - `currentNoteUrl` set before `initializeContentFeatures` (was after), so outline knows whether to show checkboxes
+  - `fetchReadingProgress()` — fetches from `GET /progress?url=` on reader init
+  - `generateOutline()` rewritten: adds progress header (label + bar), checkboxes on h2/h3 items, stores progress update callback
+  - `formatProgressLabel()`, `computeProgressWidth()` — progress bar helpers
+  - `applyOutlineProgressState()` — updates checkboxes/bar without full re-render
+  - `toggleReadingProgress()` — toggle + optimistic UI + POST to `/progress/set`
+  - Both `startHighlightSync` and `startHighlightStream` pass progress callback to SSE subscription
+  - `stopHighlightStream` clears progress state
+  - New module-level helpers: `normaliseHeading()`, `readerCheckSvg()`
+- **`src/reader.scss`**: New styles for progress header, progress bar, checkboxes, completed state, checkbox hover/checked transitions
+
+### Design decisions
+- **Outline gate**: Show for any note with 2+ headings (navigation-only). Checkboxes/progress only for notes with `source` URL.
+- **SSE reuse**: Same stream, typed payloads (`type: "highlights"` / `type: "progress"`). No second connection.
+- **Bidirectional**: Toggle in Obsidian → SSE → browser updates. Toggle in browser → POST → Obsidian updates.
+- **Progress only for h2/h3**: Matches paper-reading-tracker behavior. h4-h6 shown in outline for navigation but don't get checkboxes.
+- **Frontmatter format**: Identical `reading-progress: [...]` so paper-reading-tracker notes work immediately.
+
+### Build & deploy
+- Plugin: `bun run build` + `bun run typecheck` — clean
+- Plugin deployed to vault via `bun run deploy`
+- Extension: `bun run build` — compiled with 9 warnings (size warnings, same as before)
+
+---
+
 ## 2026-04-14 (session 3)
 
 ### Goal
@@ -109,11 +279,24 @@ Fix prooftree rendering in both reader mode and clipped markdown output. The SEP
 **`src/utils/prooftree-markdown.test.ts`**:
 - Updated multi-tree test: now expects split `$$` blocks (2 pairs of `$$`) instead of preserved `\hspace` commands.
 
+### Additional fixes (session 2)
+
+**`src/utils/obsidian-math-macros.ts`**:
+- Fixed duplicate `\newcommand` definitions: `normalizeMacrosForObsidian` now deletes both bare and `\`-prefixed keys before setting normalized values. `getMathJaxMacros` returns `\`-prefixed keys but the normalizer was setting bare keys, producing two `\newcommand{\turnstile}` — MathJax rejected the preamble.
+
+**`src/utils/prooftree-markdown.ts`**:
+- Fixed non-C `\Axiom$...$` arguments being stripped by generic `$` regex in `normalizeProoftreeLatex`: added `\Axiom$...$` → `\Axiom{...}` conversion before generic `$` stripping, then `restoreNonCSyntax` converts back to `$...$` for MathJax.
+
+**Defuddle (`src/standardize.ts`)**:
+- Added `collapseIPASpans` step: unwraps Wikipedia IPA tooltip `<span title="...">x</span>` into plain text before turndown, preventing `/m ə ˈ r uː n/` spacing.
+
 ### Current state
-- Reader mode: all ~40 prooftrees on the SEP logic-propositional page render (both natural deduction and sequent calculus). Mostly working.
-- Clip output: each prooftree gets its own clean `$$` block with `\require{bussproofs}` and no nested delimiters.
-- All 6 math e2e tests pass, all 10 prooftree unit tests pass.
-- The `entry.js` TypeError in console is from SEP's own jQuery scrollToFixed plugin — harmless, not our code.
+- Reader mode: all ~40 prooftrees render (natural deduction + sequent calculus).
+- Clip output: each prooftree gets its own clean `$$` block with proper syntax (`\AxiomC{...}` for C-variant, `\Axiom$...$` for non-C). Deduplicated `\newcommand` macro definitions.
+- All 7 math e2e tests pass (including thorough prooftree test), 17 unit tests pass, 240 defuddle vitest tests pass.
+- Wikipedia IPA renders without spaces.
+- `entry.js` TypeError is from SEP's own jQuery — harmless.
+- Note: `bun test` on defuddle shows 18 "failures" — vitest APIs (`vi.stubGlobal`) unsupported by bun's runner. Use `npx vitest run` for correct results.
 
 ---
 

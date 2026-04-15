@@ -13,6 +13,8 @@ import { getMessage, initializeI18n } from './i18n';
 import { getFontCss } from './font-utils';
 import { logHandledError } from './error-utils';
 import { renderMacroDefsForObsidian } from './obsidian-math-macros';
+import { normaliseHeading, toggleHeadingProgress as toggleProgress, recomputeParentProgress, type HeadingInfo } from './reading-progress';
+import { contentHash } from './content-hash';
 import { normalizeProoftreesForObsidian } from './prooftree-markdown';
 import { wireTranscript } from './reader-transcript';
 
@@ -49,6 +51,8 @@ export class Reader {
 	private static programmaticScrollUntil: number = 0;
 	private static readerHighlightSync: HighlightSync | null = null;
 	private static currentNoteUrl: string | null = null;
+	private static readingProgress: string[] = [];
+	private static outlineProgressUpdate: ((progress: string[]) => void) | null = null;
 	private static pluginStatusShown: boolean = false;
 	private static pendingOptimisticOps: Map<string, 'add' | 'remove'> = new Map();
 	private static boundHighlightChangedHandler: (() => void) | null = null;
@@ -1052,61 +1056,119 @@ export class Reader {
 		const article = doc.querySelector('article');
 		if (!article) return null;
 
-		// Get the existing outline container
 		const outline = doc.querySelector('.obsidian-reader-outline') as HTMLElement;
 		if (!outline) return null;
 
-		// Clear existing outline items (prevents duplication on refresh/SSE)
 		outline.textContent = '';
 
-		// Find all headings h2-h6, excluding those inside blockquotes
 		const headings = Array.from(article.querySelectorAll('h2, h3, h4, h5, h6'))
 			.filter(h => !h.closest('blockquote'));
 
-		// Only show outline if there are 2 or more headings
 		if (headings.length < 2) {
 			outline.style.display = 'none';
 			return null;
 		} else {
-			outline.style.display = ''; 
+			outline.style.display = '';
 		}
 
-		// Add unique IDs to headings if they don't have them
 		headings.forEach((heading, index) => {
 			if (!heading.id) {
 				heading.id = `heading-${index}`;
 			}
 		});
 
-		// Create outline items and store references
 		const outlineItems = new Map();
+		const trackProgress = !!this.currentNoteUrl;
+		const infos = trackProgress ? this.getArticleHeadingInfos(doc) : [];
 
-		// Add title as first outline item
+		// Progress header (only when connected to Obsidian)
+		if (trackProgress) {
+			const header = doc.createElement('div');
+			header.className = 'reader-progress-header';
+
+			const label = doc.createElement('span');
+			label.className = 'reader-progress-label';
+			label.textContent = this.formatProgressLabel(doc);
+			header.appendChild(label);
+
+			const barOuter = doc.createElement('div');
+			barOuter.className = 'reader-progress-bar';
+			const barInner = doc.createElement('div');
+			barInner.className = 'reader-progress-bar-fill';
+			barInner.style.width = this.computeProgressWidth(doc);
+			barOuter.appendChild(barInner);
+			header.appendChild(barOuter);
+
+			outline.appendChild(header);
+		}
+
+		// Title item — always visible, never faint
 		const titleHeading = doc.querySelector('.obsidian-reader-content h1');
+		let titleItem: HTMLElement | null = null;
 		if (title && titleHeading) {
-			const titleItem = doc.createElement('div');
+			titleItem = doc.createElement('div');
 			titleItem.className = 'obsidian-reader-outline-item obsidian-reader-outline-h1';
 			titleItem.setAttribute('data-depth', '0');
+			titleItem.setAttribute('data-title', 'true');
 			titleItem.textContent = title;
 			titleItem.addEventListener('click', () => {
+				if (trackProgress) {
+					const hasIntro = this.getArticleHeadingInfos(doc).some(
+						h => h.text === this.INTRO_SECTION_LABEL
+					);
+					if (hasIntro) this.toggleReadingProgress(doc, this.INTRO_SECTION_LABEL);
+				}
 				this.scrollTo(0);
 			});
 			outline.appendChild(titleItem);
 			outlineItems.set(titleHeading, titleItem);
 		}
 
-		// Keep track of the last heading at each level and their depths
+		// Introduction item (content before the first heading, only if no real heading collides)
+		const introInInfos = infos.some(h => h.text === this.INTRO_SECTION_LABEL);
+		if (trackProgress && introInInfos) {
+			const introItem = doc.createElement('div');
+			introItem.className = 'obsidian-reader-outline-item obsidian-reader-outline-h2';
+			introItem.setAttribute('data-depth', '0');
+			introItem.setAttribute('data-intro', 'true');
+
+			const introText = this.INTRO_SECTION_LABEL;
+			const isDone = this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(introText));
+			if (isDone) introItem.classList.add('reader-done');
+
+			const checkbox = doc.createElement('span');
+			checkbox.className = `reader-progress-checkbox${isDone ? ' reader-progress-checkbox-checked' : ''}`;
+			checkbox.innerHTML = isDone ? readerCheckSvg() : '';
+			checkbox.addEventListener('click', (e) => {
+				e.stopPropagation();
+				this.toggleReadingProgress(doc, introText);
+			});
+			introItem.appendChild(checkbox);
+
+			const text = doc.createElement('span');
+			text.className = 'reader-outline-text';
+			text.textContent = introText;
+			text.addEventListener('click', () => {
+				this.scrollTo(0);
+			});
+			introItem.appendChild(text);
+
+			outline.appendChild(introItem);
+			// Map intro to the h1 so scroll spy activates it when title is visible
+			if (titleHeading) {
+				outlineItems.set(titleHeading, introItem);
+			}
+		}
+
 		const lastHeadingAtLevel: { [key: number]: { element: Element; depth: number } } = {};
-		
+
 		headings.forEach((heading) => {
 			const level = parseInt(heading.tagName[1]);
 			const currentRect = heading.getBoundingClientRect();
-			
-			// Calculate depth based on parent headings
+
 			let depth = 0;
 			let parentFound = false;
-			
-			// Look through all higher levels to find the most recent parent
+
 			for (let i = level - 1; i >= 2; i--) {
 				const lastHeading = lastHeadingAtLevel[i];
 				if (lastHeading) {
@@ -1119,7 +1181,6 @@ export class Reader {
 				}
 			}
 
-			// If no parent found but we have a previous sibling at same level, use its depth
 			if (!parentFound && lastHeadingAtLevel[level]) {
 				const lastRect = lastHeadingAtLevel[level].element.getBoundingClientRect();
 				if (lastRect.top < currentRect.top) {
@@ -1130,39 +1191,59 @@ export class Reader {
 			const item = doc.createElement('div');
 			item.className = `obsidian-reader-outline-item obsidian-reader-outline-${heading.tagName.toLowerCase()}`;
 			item.setAttribute('data-depth', depth.toString());
-			item.textContent = heading.textContent;
-			
-			item.addEventListener('click', () => {
+
+			const headingText = heading.textContent || '';
+
+			// Checkbox for h2/h3 when progress tracking is active
+			if (trackProgress) {
+				const isDone = this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(headingText));
+				if (isDone) item.classList.add('reader-done');
+
+				const checkbox = doc.createElement('span');
+				checkbox.className = `reader-progress-checkbox${isDone ? ' reader-progress-checkbox-checked' : ''}`;
+				checkbox.innerHTML = isDone ? readerCheckSvg() : '';
+				checkbox.addEventListener('click', (e) => {
+					e.stopPropagation();
+					this.toggleReadingProgress(doc, headingText);
+				});
+				item.appendChild(checkbox);
+			}
+
+			const text = doc.createElement('span');
+			text.className = 'reader-outline-text';
+			text.textContent = headingText;
+			text.addEventListener('click', () => {
 				const rect = heading.getBoundingClientRect();
 				const targetY = (window.pageYOffset || doc.documentElement.scrollTop) + rect.top - window.innerHeight * 0.05;
 				this.scrollTo(targetY);
 			});
+			item.appendChild(text);
 
 			outline.appendChild(item);
 			outlineItems.set(heading, item);
-			
-			// Update tracking variables
+
 			lastHeadingAtLevel[level] = { element: heading, depth };
 		});
 
-		// Set up intersection observer for headings
+		// Intersection observer for scroll spy
 		const observerCallback = (entries: IntersectionObserverEntry[]) => {
 			entries.forEach(entry => {
 				const heading = entry.target;
 				const item = outlineItems.get(heading);
-				
+
 				if (entry.isIntersecting) {
-					// Remove active state from all items
-					outlineItems.forEach((outlineItem) => {
+					outlineItems.forEach((outlineItem: HTMLElement) => {
 						outlineItem.classList.remove('active');
 					});
 					item?.classList.add('active');
-					
-					// Update faint state for all items
-					outlineItems.forEach((outlineItem, itemHeading) => {
+
+					outlineItems.forEach((outlineItem: HTMLElement, itemHeading: Element) => {
+						// Title is always visible, never faint
+						if (outlineItem.hasAttribute('data-title')) return;
+
 						const headingRect = itemHeading.getBoundingClientRect();
 						const currentHeadingRect = heading.getBoundingClientRect();
-						
+
 						if (headingRect.top < currentHeadingRect.top) {
 							outlineItem.classList.add('faint');
 						} else {
@@ -1174,7 +1255,7 @@ export class Reader {
 		};
 
 		const observer = new IntersectionObserver(observerCallback, {
-			rootMargin: '-5% 0px -85% 0px', // Triggers when heading is in top 20% of viewport
+			rootMargin: '-5% 0px -85% 0px',
 			threshold: 0
 		});
 
@@ -1185,14 +1266,14 @@ export class Reader {
 			observer.observe(heading);
 		});
 
-		// Add footnotes link if there are footnotes
+		// Footnotes link
 		const footnotes = article.querySelector('#footnotes');
 		if (footnotes) {
 			const item = doc.createElement('div');
 			item.className = 'obsidian-reader-outline-item';
 			item.setAttribute('data-depth', '0');
 			item.textContent = getMessage('readerFootnotes');
-			
+
 			item.addEventListener('click', () => {
 				const rect = footnotes.getBoundingClientRect();
 				const targetY = (window.pageYOffset || doc.documentElement.scrollTop) + rect.top - window.innerHeight * 0.05;
@@ -1204,7 +1285,216 @@ export class Reader {
 			observer.observe(footnotes);
 		}
 
+		// Store the update callback for SSE progress changes
+		this.outlineProgressUpdate = (progress: string[]) => {
+			this.readingProgress = progress;
+			const infos = this.getArticleHeadingInfos(doc);
+			if (infos.length > 0 && progress.length > 0) {
+				recomputeParentProgress(infos, this.readingProgress);
+			}
+			this.applyOutlineProgressState(doc);
+		};
+
 		return observer;
+	}
+
+	private static formatProgressLabel(doc: Document): string {
+		const infos = this.getArticleHeadingInfos(doc);
+		const completed = infos.filter(h =>
+			this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(h.text))
+		).length;
+		return `${completed}/${infos.length} sections`;
+	}
+
+	private static computeProgressWidth(doc: Document): string {
+		const infos = this.getArticleHeadingInfos(doc);
+		if (infos.length === 0) return '0%';
+		const completed = infos.filter(h =>
+			this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(h.text))
+		).length;
+		return `${(completed / infos.length) * 100}%`;
+	}
+
+	private static applyOutlineProgressState(doc: Document): void {
+		const outline = doc.querySelector('.obsidian-reader-outline') as HTMLElement;
+		if (!outline) return;
+
+		// Update header
+		const label = outline.querySelector('.reader-progress-label');
+		if (label) label.textContent = this.formatProgressLabel(doc);
+		const barFill = outline.querySelector<HTMLElement>('.reader-progress-bar-fill');
+		if (barFill) barFill.style.width = this.computeProgressWidth(doc);
+
+		// Update checkboxes
+		const items = outline.querySelectorAll<HTMLElement>('.obsidian-reader-outline-item');
+		items.forEach(item => {
+			const checkbox = item.querySelector<HTMLElement>('.reader-progress-checkbox');
+			if (!checkbox) return;
+			const text = item.querySelector('.reader-outline-text')?.textContent || '';
+			const isDone = this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(text));
+			item.classList.toggle('reader-done', isDone);
+			checkbox.classList.toggle('reader-progress-checkbox-checked', isDone);
+			checkbox.innerHTML = isDone ? readerCheckSvg() : '';
+		});
+
+		// Sync coins: remove for completed, re-add for uncompleted
+		const article = doc.querySelector('article');
+		if (article) {
+			const existingCoins = new Set<string>();
+			article.querySelectorAll<HTMLElement>('.reader-coin').forEach(coin => {
+				const section = coin.getAttribute('data-section') || '';
+				existingCoins.add(normaliseHeading(section));
+				if (coin.classList.contains('reader-coin-cut')) return;
+				if (this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(section))) {
+					coin.remove();
+				}
+			});
+
+			// Re-add coins for sections that were uncompleted (toggled off)
+			const headings = Array.from(article.querySelectorAll('h2, h3, h4, h5, h6'))
+				.filter(h => !h.closest('blockquote'));
+			const infos = this.getArticleHeadingInfos(doc);
+
+			for (let i = 0; i < headings.length; i++) {
+				const text = headings[i].textContent || '';
+				const norm = normaliseHeading(text);
+				if (existingCoins.has(norm)) continue; // already has a coin
+				if (this.readingProgress.some(p => normaliseHeading(p) === norm)) continue; // still completed
+
+				const level = parseInt(headings[i].tagName[1]);
+				const hasChildren = i + 1 < headings.length && parseInt(headings[i + 1].tagName[1]) > level;
+				const info = infos.find(h => normaliseHeading(h.text) === norm);
+				if (hasChildren && !info?.hasOwnContent) continue; // pure parent
+
+				// Find insertion point
+				if (info?.hasOwnContent && hasChildren) {
+					headings[i + 1].parentNode?.insertBefore(this.makeCoin(doc, text), headings[i + 1]);
+				} else {
+					let boundary: Element | null = null;
+					for (let j = i + 1; j < headings.length; j++) {
+						if (parseInt(headings[j].tagName[1]) <= level) { boundary = headings[j]; break; }
+					}
+					if (boundary) {
+						boundary.parentNode?.insertBefore(this.makeCoin(doc, text), boundary);
+					} else {
+						const fn = article.querySelector('#footnotes');
+						if (fn) fn.parentNode?.insertBefore(this.makeCoin(doc, text), fn);
+						else article.appendChild(this.makeCoin(doc, text));
+					}
+				}
+			}
+
+			// Also handle Introduction
+			const introNorm = normaliseHeading(this.INTRO_SECTION_LABEL);
+			if (!existingCoins.has(introNorm) && this.hasIntroContent(article)
+				&& !this.readingProgress.some(p => normaliseHeading(p) === introNorm) && headings.length > 0) {
+				headings[0].parentNode?.insertBefore(this.makeCoin(doc, this.INTRO_SECTION_LABEL), headings[0]);
+			}
+		}
+	}
+
+	private static async fetchReadingProgress(): Promise<void> {
+		if (!this.currentNoteUrl) {
+			this.readingProgress = [];
+			return;
+		}
+		try {
+			const res = await pluginFetch(`/progress?url=${encodeURIComponent(this.currentNoteUrl)}`);
+			if (res.ok) {
+				const data = res.data as { progress?: string[] };
+				this.readingProgress = Array.isArray(data.progress) ? data.progress : [];
+			} else {
+				this.readingProgress = [];
+			}
+		} catch {
+			this.readingProgress = [];
+		}
+	}
+
+	private static async checkSourceChanged(doc: Document): Promise<void> {
+		if (!this.currentNoteUrl) return;
+		try {
+			const res = await pluginFetch(`/source-hash?url=${encodeURIComponent(this.currentNoteUrl)}`);
+			if (!res.ok) return;
+			const data = res.data as { hash?: string | null };
+			const storedHash = data.hash;
+			if (!storedHash) return; // no hash stored (old clip)
+
+			const article = doc.querySelector('article');
+			if (!article) return;
+			const currentHash = contentHash(article.textContent || '');
+			if (currentHash !== storedHash) {
+				this.showToast(doc, 'This page has changed since it was clipped.');
+			}
+		} catch { /* plugin offline */ }
+	}
+
+	private static readonly INTRO_SECTION_LABEL = 'Introduction';
+
+	private static getArticleHeadingInfos(doc: Document): HeadingInfo[] {
+		const article = doc.querySelector('article');
+		if (!article) return [];
+		const domHeadings = Array.from(article.querySelectorAll('h2, h3, h4, h5, h6'))
+			.filter(h => !h.closest('blockquote'));
+		const headings: HeadingInfo[] = domHeadings.map((h, i) => {
+			const level = parseInt(h.tagName[1]) as HeadingInfo['level'];
+			const hasOwnContent = this.headingHasOwnContent(h, domHeadings[i + 1]);
+			return { text: h.textContent || '', level, ...(hasOwnContent ? { hasOwnContent } : {}) };
+		});
+		// Add synthetic intro entry only if no real heading already matches the label
+		const introCollides = headings.some(h => normaliseHeading(h.text) === normaliseHeading(this.INTRO_SECTION_LABEL));
+		if (this.hasIntroContent(article) && !introCollides) {
+			headings.unshift({ text: this.INTRO_SECTION_LABEL, level: 2 });
+		}
+		return headings;
+	}
+
+	/** Check if a heading has text content before the next heading (its own prose, not just child headings). */
+	private static headingHasOwnContent(heading: Element, nextHeading?: Element): boolean {
+		const headingLevel = parseInt(heading.tagName[1]);
+		let el: Element | null = heading.nextElementSibling;
+		while (el) {
+			if (el === nextHeading) break;
+			// Hit a child heading — check if there was content before it
+			if (el.matches('h2, h3, h4, h5, h6') && !el.closest('blockquote')) {
+				const childLevel = parseInt(el.tagName[1]);
+				if (childLevel <= headingLevel) break; // sibling or parent heading
+				return false; // reached child heading with no content in between
+			}
+			if ((el.textContent || '').trim().length > 0) return true;
+			el = el.nextElementSibling;
+		}
+		return false;
+	}
+
+	/** Check if the article has meaningful content before the first section heading. */
+	private static hasIntroContent(article: Element): boolean {
+		const firstH2 = article.querySelector('h2, h3, h4, h5, h6');
+		if (!firstH2) return false;
+		let el: Element | null = firstH2.previousElementSibling;
+		while (el) {
+			if (!el.matches('h1') && (el.textContent || '').trim().length > 0) return true;
+			el = el.previousElementSibling;
+		}
+		return false;
+	}
+
+	private static async toggleReadingProgress(doc: Document, headingText: string): Promise<void> {
+		const headingInfos = this.getArticleHeadingInfos(doc);
+		toggleProgress(headingInfos, this.readingProgress, headingText);
+
+		// Optimistic UI update
+		this.applyOutlineProgressState(doc);
+
+		// Sync to plugin
+		if (this.currentNoteUrl) {
+			try {
+				await pluginFetch('/progress/set', {
+					method: 'POST',
+					body: { url: this.currentNoteUrl, progress: this.readingProgress },
+				});
+			} catch { /* plugin offline — progress stays local */ }
+		}
 	}
 
 	private static observer: IntersectionObserver | null = null;
@@ -1491,7 +1781,10 @@ export class Reader {
 		const codeBlocks = doc.querySelectorAll('pre > code');
 		codeBlocks.forEach(block => {
 			const pre = block.parentElement as HTMLElement;
-			
+
+			// Strip any existing copy/toolbar buttons from flattened shadow DOM
+			pre.querySelectorAll('button').forEach(btn => btn.remove());
+
 			const button = doc.createElement('button');
 			button.className = 'copy-button';
 			
@@ -2535,6 +2828,19 @@ export class Reader {
 			footer.textContent = footerItems.join(' · ');
 			footer.style.display = '';
 
+			// Set up the current URL for highlight/progress tracking
+			// Strip all hash fragments — same page, same highlights regardless of anchor.
+			this.currentNoteUrl = doc.URL.replace(/#.*$/, '');
+
+			// Fetch reading progress before generating outline
+			await this.fetchReadingProgress();
+
+			// Recompute parent completion from stored leaf progress
+			const headingInfos = this.getArticleHeadingInfos(doc);
+			if (headingInfos.length > 0 && this.readingProgress.length > 0) {
+				recomputeParentProgress(headingInfos, this.readingProgress);
+			}
+
 			// Initialize content-dependent features
 			await this.initializeContentFeatures(doc, title);
 
@@ -2543,10 +2849,6 @@ export class Reader {
 
 			// Auto-enable highlighter for all reader mode pages
 			toggleHighlighterMenu(true);
-
-			// Set up the current URL for highlight tracking
-			// Strip all hash fragments — same page, same highlights regardless of anchor.
-			this.currentNoteUrl = doc.URL.replace(/#.*$/, '');
 
 			if (extractorType === 'obsidian-note' && notePath) {
 				if (!this.pluginStatusShown) {
@@ -2568,6 +2870,9 @@ export class Reader {
 				this.startHighlightSync(doc);
 			}
 
+			// Check if source page has changed since clipping
+			this.checkSourceChanged(doc);
+
 		} catch (e) {
 			console.error('Reader', 'Error during apply:', e);
 			if (resolveViewTransition) resolveViewTransition();
@@ -2578,6 +2883,8 @@ export class Reader {
 
 	private static async initializeContentFeatures(doc: Document, title?: string): Promise<void> {
 		this.observer = this.generateOutline(doc, title);
+		this.wireHeadingProgressToggle(doc);
+		this.placeCompletionCoins(doc);
 		this.initializeFootnotes(doc);
 		this.initializeCodeHighlighting(doc);
 		this.initializeCopyButtons(doc);
@@ -2585,6 +2892,197 @@ export class Reader {
 		this.linkifyTextUrls(doc);
 		this.initializeComments(doc);
 		await this.renderMath(doc);
+	}
+
+	private static wireHeadingProgressToggle(doc: Document): void {
+		if (!this.currentNoteUrl) return;
+		const article = doc.querySelector('article');
+		if (!article) return;
+
+		article.addEventListener('click', (e) => {
+			const target = e.target as Element | null;
+			if (!target) return;
+			// Don't interfere with links inside headings
+			if (target.closest('a')) return;
+			const heading = target.closest('h2, h3, h4, h5, h6');
+			if (!heading || !article.contains(heading)) return;
+			// Don't toggle if text was selected (user was highlighting)
+			const sel = window.getSelection();
+			if (sel && !sel.isCollapsed) return;
+
+			e.preventDefault();
+			this.toggleReadingProgress(doc, heading.textContent || '');
+		});
+	}
+
+	/** Place coin elements at the end of each completable section. */
+	private static placeCompletionCoins(doc: Document): void {
+		if (!this.currentNoteUrl) return;
+		const article = doc.querySelector('article');
+		if (!article) return;
+
+		const headings = Array.from(article.querySelectorAll('h2, h3, h4, h5, h6'))
+			.filter(h => !h.closest('blockquote'));
+		const infos = this.getArticleHeadingInfos(doc);
+		if (infos.length === 0) return;
+
+		// Track mouse velocity for coin slicing
+		let lastX = 0, lastY = 0, lastTime = 0;
+		let velX = 0, velY = 0;
+		const SPEED_THRESHOLD = 800; // px/s
+
+		const onMouseMove = (e: MouseEvent) => {
+			const now = performance.now();
+			if (lastTime > 0) {
+				const dt = (now - lastTime) / 1000;
+				if (dt > 0) {
+					velX = (e.clientX - lastX) / dt;
+					velY = (e.clientY - lastY) / dt;
+					const speed = Math.sqrt(velX * velX + velY * velY);
+
+					if (speed > SPEED_THRESHOLD) {
+						const coin = doc.elementFromPoint(e.clientX, e.clientY)?.closest('.reader-coin') as HTMLElement | null;
+						if (coin && !coin.classList.contains('reader-coin-cut')) {
+							this.sliceCoin(doc, coin, velX, velY);
+						}
+					}
+				}
+			}
+			lastX = e.clientX;
+			lastY = e.clientY;
+			lastTime = now;
+		};
+
+		doc.addEventListener('mousemove', onMouseMove);
+
+		const insertCoin = (beforeEl: Element, sectionText: string) => {
+			if (this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(sectionText))) return;
+			beforeEl.parentNode?.insertBefore(this.makeCoin(doc, sectionText), beforeEl);
+		};
+
+		// Introduction section: coin before first heading
+		const introInfo = infos.find(h => h.text === this.INTRO_SECTION_LABEL);
+		if (introInfo && headings.length > 0) {
+			insertCoin(headings[0], this.INTRO_SECTION_LABEL);
+		}
+
+		// Place coins only for sections that need independent completion:
+		// - Leaf headings (no children)
+		// - Parent headings with hasOwnContent (independent checkbox)
+		// Pure parent headings (auto-derived from children) don't get coins.
+		for (let i = 0; i < headings.length; i++) {
+			const heading = headings[i];
+			const text = heading.textContent || '';
+			const level = parseInt(heading.tagName[1]);
+
+			// Check if this heading has child headings
+			const hasChildren = i + 1 < headings.length && parseInt(headings[i + 1].tagName[1]) > level;
+
+			// Find matching HeadingInfo to check hasOwnContent
+			const info = infos.find(h => normaliseHeading(h.text) === normaliseHeading(text));
+			const isOwnContent = info?.hasOwnContent === true;
+
+			// Skip pure parents — their completion is auto-derived from children
+			if (hasChildren && !isOwnContent) continue;
+
+			if (isOwnContent && hasChildren) {
+				// hasOwnContent parent: coin goes before the first child heading
+				insertCoin(headings[i + 1], text);
+			} else {
+				// Leaf heading: coin goes before next heading at same or shallower level
+				let nextBoundary: Element | null = null;
+				for (let j = i + 1; j < headings.length; j++) {
+					if (parseInt(headings[j].tagName[1]) <= level) {
+						nextBoundary = headings[j];
+						break;
+					}
+				}
+
+				if (nextBoundary) {
+					insertCoin(nextBoundary, text);
+				} else {
+					const footnotes = article.querySelector('#footnotes');
+					if (footnotes) {
+						insertCoin(footnotes, text);
+					} else if (!this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(text))) {
+						article.appendChild(this.makeCoin(doc, text));
+					}
+				}
+			}
+		}
+	}
+
+	private static makeCoin(doc: Document, sectionText: string): HTMLElement {
+		const coin = doc.createElement('div');
+		coin.className = 'reader-coin';
+		coin.setAttribute('data-section', sectionText);
+		for (const cls of ['reader-coin-face', 'reader-coin-half reader-coin-half-a', 'reader-coin-half reader-coin-half-b', 'reader-coin-slash']) {
+			const el = doc.createElement('div');
+			el.className = cls;
+			coin.appendChild(el);
+		}
+		return coin;
+	}
+
+	private static sliceCoin(doc: Document, coin: HTMLElement, velX: number, velY: number): void {
+		if (coin.classList.contains('reader-coin-cut')) return;
+
+		const halves = coin.querySelectorAll<HTMLElement>('.reader-coin-half');
+		if (halves.length < 2) {
+			coin.remove();
+			return;
+		}
+
+		const sectionText = coin.getAttribute('data-section') || '';
+		const slash = coin.querySelector<HTMLElement>('.reader-coin-slash');
+
+		const angle = Math.atan2(velY, velX);
+		const angleDeg = angle * (180 / Math.PI);
+		const perpRad = angle + Math.PI / 2;
+
+		coin.style.setProperty('--reader-coin-slash-angle', `${angleDeg}deg`);
+		if (slash) slash.style.removeProperty('transform');
+
+		// Clip each half and let CSS keyframes handle the visible split. This avoids
+		// Firefox extension content-script quirks around Element.animate().
+		const cos = Math.cos(angle), sin = Math.sin(angle);
+		const nx = Math.cos(perpRad), ny = Math.sin(perpRad);
+		const rect = coin.getBoundingClientRect();
+		const width = rect.width || 30;
+		const height = rect.height || 30;
+		const cx = width / 2;
+		const cy = height / 2;
+		const R = Math.max(width, height) * 3;
+
+		const ax = cx - cos * R, ay = cy - sin * R;
+		const bx = cx + cos * R, by = cy + sin * R;
+
+		const drift = 30; // px — how far halves fly apart
+
+		for (let i = 0; i < 2 && i < halves.length; i++) {
+			const half = halves[i];
+			const sign = i === 0 ? 1 : -1;
+			const sx = cx + sign * nx * R;
+			const sy = cy + sign * ny * R;
+			const dx = sign * nx * drift;
+			const dy = sign * ny * drift + 12; // add gravity
+
+			const clipPath = `polygon(${ax}px ${ay}px, ${bx}px ${by}px, ${sx}px ${sy}px)`;
+			half.style.setProperty('clip-path', clipPath);
+			half.style.setProperty('-webkit-clip-path', clipPath);
+			half.style.setProperty('--reader-coin-half-dx', `${dx}px`);
+			half.style.setProperty('--reader-coin-half-dy', `${dy}px`);
+			half.style.setProperty('--reader-coin-half-rot', `${sign * 20}deg`);
+		}
+
+		// Start class-based animations after all clip/drift variables are ready.
+		coin.classList.add('reader-coin-cut');
+
+		if (sectionText) {
+			this.toggleReadingProgress(doc, sectionText);
+		}
+
+		setTimeout(() => coin.remove(), 700);
 	}
 
 	private static latexToReaderText(latex: string): string {
@@ -3301,7 +3799,8 @@ export class Reader {
 		this.attachSyncListeners(doc, () => this.loadAndApplyReaderHighlights(doc));
 		this.readerHighlightSync = subscribeHighlightChanges(
 			this.currentNoteUrl,
-			() => this.loadAndApplyReaderHighlights(doc)
+			() => this.loadAndApplyReaderHighlights(doc),
+			(progress) => this.outlineProgressUpdate?.(progress),
 		);
 	}
 
@@ -3445,7 +3944,8 @@ export class Reader {
 
 		this.readerHighlightSync = subscribeHighlightChanges(
 			this.currentNoteUrl,
-			() => this.refreshObsidianContent(doc)
+			() => this.refreshObsidianContent(doc),
+			(progress) => this.outlineProgressUpdate?.(progress),
 		);
 	}
 
@@ -3455,6 +3955,8 @@ export class Reader {
 			this.readerHighlightSync = null;
 		}
 		this.currentNoteUrl = null;
+		this.readingProgress = [];
+		this.outlineProgressUpdate = null;
 		this.pendingOptimisticOps.clear();
 		this.markClickWired = false;
 		if (this.removeMarkClickHandler) {
@@ -3608,4 +4110,8 @@ export class Reader {
 			return true;
 		}
 	}
+}
+
+function readerCheckSvg(): string {
+	return '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
 }

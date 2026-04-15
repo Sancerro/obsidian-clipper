@@ -1252,10 +1252,10 @@
 	box-sizing: border-box;
 	background: var(--background-primary);
 	position: sticky;
-	top: 0;
-	height: 100vh;
+	top: max(4rem, 4vh);
+	max-height: 60vh;
 	min-width: 200px;
-	padding: max(4rem, 4vh) var(--size-4-5) var(--size-4-5) var(--size-4-5);
+	padding: 0 var(--size-4-5) var(--size-4-5) calc(var(--size-4-5) + 24px);
 	overflow-y: auto;
 	font-size: var(--font-ui-small);
 	user-select: none;
@@ -1300,6 +1300,217 @@
 }
 .obsidian-reader-outline-item.faint:hover {
 	color: var(--text-muted);
+}
+
+// Reading progress header
+.reader-progress-header {
+	padding: 0 8px 10px;
+	margin-bottom: 4px;
+}
+.reader-progress-label {
+	display: block;
+	font-size: 12px;
+	font-weight: 500;
+	color: var(--text-muted);
+	letter-spacing: 0.02em;
+}
+.reader-progress-bar {
+	width: 100%;
+	height: 2px;
+	background: var(--background-modifier-border);
+	border-radius: 1px;
+	overflow: hidden;
+	margin-top: 8px;
+}
+.reader-progress-bar-fill {
+	height: 100%;
+	background: var(--interactive-accent);
+	border-radius: 1px;
+	transition: width 0.2s ease;
+}
+
+// Outline item with checkbox
+.obsidian-reader-outline-item {
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+}
+.reader-outline-text {
+	flex: 1;
+	min-width: 0;
+	word-break: break-word;
+}
+.reader-progress-checkbox {
+	flex-shrink: 0;
+	width: 14px;
+	height: 14px;
+	margin-top: 1px;
+	border: 1.5px solid var(--text-faint);
+	border-radius: 3px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	transition: border-color 0.15s ease, background 0.15s ease;
+	&:hover {
+		border-color: var(--text-muted);
+	}
+}
+.reader-progress-checkbox-checked {
+	background: var(--interactive-accent);
+	border-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+// Article headings clickable for progress toggle
+.obsidian-reader-active article h2,
+.obsidian-reader-active article h3,
+.obsidian-reader-active article h4,
+.obsidian-reader-active article h5,
+.obsidian-reader-active article h6 {
+	cursor: pointer;
+}
+
+.obsidian-reader-active article summary {
+	cursor: pointer;
+}
+
+// Completed section
+.obsidian-reader-outline-item.reader-done .reader-outline-text {
+	text-decoration: line-through;
+	color: var(--text-faint) !important;
+	opacity: 0.6;
+}
+.obsidian-reader-outline-item.active.reader-done .reader-outline-text {
+	color: var(--interactive-accent) !important;
+	opacity: 0.7;
+}
+
+// Section completion coins
+.reader-coin {
+	--reader-coin-slash-angle: 0deg;
+	width: 30px;
+	height: 30px;
+	position: relative;
+	float: right;
+	margin: 4px 36px 8px 12px;
+	cursor: default;
+	user-select: none;
+	z-index: 1;
+	overflow: visible;
+}
+
+.reader-coin-cut {
+	pointer-events: none;
+}
+
+.reader-coin-face {
+	position: absolute;
+	inset: 0;
+	border-radius: 50%;
+	background: linear-gradient(135deg, #f0c850 0%, #d4a017 50%, #f0c850 100%);
+	box-shadow: 0 1px 3px rgba(0,0,0,0.18), inset 0 1px 1px rgba(255,255,255,0.4);
+	transition: transform 0.15s ease;
+	z-index: 2;
+
+	&::after {
+		content: '';
+		position: absolute;
+		inset: 5px;
+		border-radius: 50%;
+		border: 1.5px solid rgba(255,255,255,0.35);
+	}
+}
+
+.reader-coin.reader-coin-cut .reader-coin-face {
+	opacity: 0;
+	transform: scale(0.98);
+	transition: none;
+}
+
+.reader-coin:hover .reader-coin-face {
+	transform: scale(1.12);
+}
+
+// Slash line — sits on top of everything
+.reader-coin-slash {
+	position: absolute;
+	top: 50%;
+	left: -6px;
+	right: -6px;
+	height: 2px;
+	background: #fff;
+	box-shadow: 0 0 8px 2px rgba(255,255,255,0.8);
+	transform-origin: center;
+	pointer-events: none;
+	z-index: 3;
+	opacity: 0;
+	transform: translateY(-50%) rotate(var(--reader-coin-slash-angle));
+	will-change: opacity;
+}
+
+.reader-coin-cut .reader-coin-slash {
+	animation: reader-coin-slash-flash 350ms ease-out forwards;
+}
+
+// Each half — sits behind the face, visible once the coin is cut
+.reader-coin-half {
+	--reader-coin-half-dx: 0px;
+	--reader-coin-half-dy: 0px;
+	--reader-coin-half-rot: 0deg;
+	display: block;
+	position: absolute;
+	inset: 0;
+	box-sizing: border-box;
+	border-radius: 50%;
+	background: linear-gradient(135deg, #f0c850 0%, #d4a017 50%, #f0c850 100%);
+	box-shadow: 0 1px 3px rgba(0,0,0,0.18), inset 0 1px 1px rgba(255,255,255,0.4);
+	opacity: 0;
+	visibility: hidden;
+	transform: translate(0, 0) rotate(0deg) scale(1);
+	transform-origin: center;
+	pointer-events: none;
+	will-change: transform, opacity;
+	z-index: 1;
+
+	&::after {
+		content: '';
+		position: absolute;
+		inset: 5px;
+		border-radius: 50%;
+		border: 1.5px solid rgba(255,255,255,0.35);
+	}
+}
+
+.reader-coin-cut .reader-coin-half {
+	visibility: visible;
+	animation: reader-coin-half-drift 600ms ease-out forwards;
+}
+
+@keyframes reader-coin-slash-flash {
+	0% {
+		opacity: 1;
+	}
+	40% {
+		opacity: 1;
+	}
+	100% {
+		opacity: 0;
+	}
+}
+
+@keyframes reader-coin-half-drift {
+	0% {
+		opacity: 1;
+		transform: translate(0, 0) rotate(0deg) scale(1);
+	}
+	70% {
+		opacity: 0.9;
+	}
+	100% {
+		opacity: 0;
+		transform: translate(var(--reader-coin-half-dx), var(--reader-coin-half-dy)) rotate(var(--reader-coin-half-rot)) scale(0.7);
+	}
 }
 
 @media (max-width: 768px) {
