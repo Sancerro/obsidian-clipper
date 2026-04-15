@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Prooftree with Nested Delimiters</title>
+    <script type="text/javascript">
+    window.MathJax = {
+        tex: { macros: { rA: "\\text{A}", rB: "\\text{B}" } }
+    };
+    </script>
+</head>
+<body>
+    <article>
+        <h1>Natural Deduction Rules</h1>
+
+        <p>Inline prooftree with nested delimiters:</p>
+
+        <p><em>modus ponens</em>: \(\begin{prooftree}
+\AxiomC{\(\rA\supset\rB\)}\AxiomC{\(\rA\)}\BinaryInfC{\(\rB\)}
+\end{prooftree}\)</p>
+
+        <p>Display prooftree:</p>
+\[
+\begin{prooftree} \AxiomC{\(\rA\supset\rB\)} \AxiomC{\(\rA\)}
+\RightLabel{\({\supset}\text{elim}\)} \BinaryInfC{\(\rB\)}
+\end{prooftree}
+\]
+
+        <p>Simple inline math: \(x^2 + y^2 = z^2\) and display:</p>
+
+        <p>\[E = mc^2\]</p>
+    </article>
+</body>
+</html>
