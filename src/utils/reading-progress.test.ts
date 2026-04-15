@@ -9,6 +9,8 @@ import {
 	type HeadingInfo,
 } from './reading-progress';
 
+// ── Fixtures ──────────────────────────────────────────────────
+
 const HEADINGS: HeadingInfo[] = [
 	{ text: 'Personality', level: 2 },
 	{ text: 'Work habits', level: 3 },
@@ -44,6 +46,49 @@ const GAP_HEADINGS: HeadingInfo[] = [
 	{ text: 'Bottom Line', level: 2 },
 ];
 
+// Parent headings with own content — independent checkboxes
+const OWN_CONTENT_HEADINGS: HeadingInfo[] = [
+	{ text: 'Types of Fiber', level: 2, hasOwnContent: true },
+	{ text: 'Soluble fiber', level: 3 },
+	{ text: 'Insoluble fiber', level: 3 },
+	{ text: 'Benefits', level: 2 },
+];
+
+// Mixed: some parents with own content, some without
+const MIXED_HEADINGS: HeadingInfo[] = [
+	{ text: 'Overview', level: 2, hasOwnContent: true },
+	{ text: 'History', level: 3 },
+	{ text: 'Modern era', level: 3 },
+	{ text: 'Technical details', level: 2 },  // pure parent (no own content)
+	{ text: 'Architecture', level: 3 },
+	{ text: 'Implementation', level: 3 },
+	{ text: 'Performance', level: 2 },  // leaf
+];
+
+// Deep with hasOwnContent at multiple levels
+const DEEP_OWN_CONTENT: HeadingInfo[] = [
+	{ text: 'JVM', level: 2, hasOwnContent: true },
+	{ text: 'Bytecode', level: 3, hasOwnContent: true },
+	{ text: 'Verification', level: 4 },
+	{ text: 'Execution', level: 4 },
+	{ text: 'Garbage collection', level: 3 },
+	{ text: 'Security', level: 2 },
+];
+
+// Single heading (edge case)
+const SINGLE_HEADING: HeadingInfo[] = [
+	{ text: 'Only section', level: 2 },
+];
+
+// All same level (flat structure)
+const FLAT_HEADINGS: HeadingInfo[] = [
+	{ text: 'Section A', level: 2 },
+	{ text: 'Section B', level: 2 },
+	{ text: 'Section C', level: 2 },
+];
+
+// ── normaliseHeading ──────────────────────────────────────────
+
 describe('normaliseHeading', () => {
 	test('trims and collapses whitespace', () => {
 		expect(normaliseHeading('  hello   world  ')).toBe('hello world');
@@ -52,7 +97,25 @@ describe('normaliseHeading', () => {
 	test('handles newlines and tabs', () => {
 		expect(normaliseHeading('hello\n\tworld')).toBe('hello world');
 	});
+
+	test('empty string', () => {
+		expect(normaliseHeading('')).toBe('');
+	});
+
+	test('only whitespace', () => {
+		expect(normaliseHeading('   \t\n  ')).toBe('');
+	});
+
+	test('single word no change', () => {
+		expect(normaliseHeading('Overview')).toBe('Overview');
+	});
+
+	test('preserves case', () => {
+		expect(normaliseHeading('JVM in the Web Browser')).toBe('JVM in the Web Browser');
+	});
 });
+
+// ── headingMatches ────────────────────────────────────────────
 
 describe('headingMatches', () => {
 	test('matches identical strings', () => {
@@ -66,7 +129,17 @@ describe('headingMatches', () => {
 	test('rejects different strings', () => {
 		expect(headingMatches('Personality', 'Career')).toBe(false);
 	});
+
+	test('matches with leading/trailing whitespace', () => {
+		expect(headingMatches('  Personality  ', 'Personality')).toBe(true);
+	});
+
+	test('empty strings match', () => {
+		expect(headingMatches('', '  ')).toBe(true);
+	});
 });
+
+// ── buildHierarchy ────────────────────────────────────────────
 
 describe('buildHierarchy', () => {
 	test('maps h2 parents to h3 children', () => {
@@ -89,7 +162,6 @@ describe('buildHierarchy', () => {
 			'Suicide in Vought Tower',
 			'Legacy',
 		]);
-		// Season 1 has no h4 children
 		expect(hierarchy.get('Season 1')).toEqual([]);
 	});
 
@@ -102,7 +174,63 @@ describe('buildHierarchy', () => {
 		const hierarchy = buildHierarchy(DEEP_HEADINGS);
 		expect(hierarchy.size).toBe(DEEP_HEADINGS.length);
 	});
+
+	test('flat headings (all same level) have no children', () => {
+		const hierarchy = buildHierarchy(FLAT_HEADINGS);
+		expect(hierarchy.get('Section A')).toEqual([]);
+		expect(hierarchy.get('Section B')).toEqual([]);
+		expect(hierarchy.get('Section C')).toEqual([]);
+	});
+
+	test('single heading', () => {
+		const hierarchy = buildHierarchy(SINGLE_HEADING);
+		expect(hierarchy.get('Only section')).toEqual([]);
+		expect(hierarchy.size).toBe(1);
+	});
+
+	test('empty input', () => {
+		const hierarchy = buildHierarchy([]);
+		expect(hierarchy.size).toBe(0);
+	});
 });
+
+// ── getDescendants ────────────────────────────────────────────
+
+describe('getDescendants', () => {
+	test('returns all nested descendants', () => {
+		const desc = getDescendants(DEEP_HEADINGS, 0); // The Boys Series
+		expect(desc).toEqual([
+			'Background', 'Childhood', 'Hero Career',
+			'Season 1',
+			'Season 2', 'Lamplighter takes a stand', 'Suicide in Vought Tower', 'Legacy',
+		]);
+	});
+
+	test('stops at same-level heading', () => {
+		const desc = getDescendants(HEADINGS, 0); // Personality
+		expect(desc).toEqual([
+			'Work habits', 'Mathematical range',
+			'Preferred problem-solving techniques', 'Lecture style',
+		]);
+		expect(desc).not.toContain('Career');
+	});
+
+	test('leaf heading has no descendants', () => {
+		expect(getDescendants(HEADINGS, 8)).toEqual([]); // Legacy
+		expect(getDescendants(HEADINGS, 1)).toEqual([]); // Work habits
+	});
+
+	test('finds h4 under h2 despite level gap', () => {
+		const desc = getDescendants(GAP_HEADINGS, 2); // Fiber and Disease
+		expect(desc).toContain('Should I avoid nuts and seeds?');
+	});
+
+	test('last heading in list', () => {
+		expect(getDescendants(FLAT_HEADINGS, 2)).toEqual([]); // Section C
+	});
+});
+
+// ── recomputeParentProgress ───────────────────────────────────
 
 describe('recomputeParentProgress', () => {
 	test('auto-completes parent when all children are done', () => {
@@ -119,7 +247,6 @@ describe('recomputeParentProgress', () => {
 
 	test('removes parent when a child is unchecked', () => {
 		const progress = ['Personality', 'Work habits', 'Mathematical range', 'Preferred problem-solving techniques'];
-		// Lecture style missing
 		recomputeParentProgress(HEADINGS, progress);
 		expect(progress).not.toContain('Personality');
 	});
@@ -138,14 +265,14 @@ describe('recomputeParentProgress', () => {
 
 	test('cascades bottom-up: completing h4s completes h3 then h2', () => {
 		const progress = [
-			'Childhood', 'Hero Career',          // all h4s under Background
-			'Season 1',                           // leaf h3
-			'Lamplighter takes a stand', 'Suicide in Vought Tower', 'Legacy', // all h4s under Season 2
+			'Childhood', 'Hero Career',
+			'Season 1',
+			'Lamplighter takes a stand', 'Suicide in Vought Tower', 'Legacy',
 		];
 		recomputeParentProgress(DEEP_HEADINGS, progress);
-		expect(progress).toContain('Background');  // h4s complete → h3 auto-completes
-		expect(progress).toContain('Season 2');    // h4s complete → h3 auto-completes
-		expect(progress).toContain('The Boys Series'); // all h3s complete → h2 auto-completes
+		expect(progress).toContain('Background');
+		expect(progress).toContain('Season 2');
+		expect(progress).toContain('The Boys Series');
 	});
 
 	test('incomplete h4 prevents h3 and h2 from auto-completing', () => {
@@ -154,14 +281,78 @@ describe('recomputeParentProgress', () => {
 		expect(progress).not.toContain('Background');
 		expect(progress).not.toContain('The Boys Series');
 	});
+
+	test('auto-completes parent with level gap', () => {
+		const progress = ['Should I avoid nuts and seeds?'];
+		recomputeParentProgress(GAP_HEADINGS, progress);
+		expect(progress).toContain('Fiber and Disease');
+	});
+
+	test('removes parent when level-gap child is unchecked', () => {
+		const progress = ['Fiber and Disease', 'Should I avoid nuts and seeds?'];
+		progress.splice(progress.indexOf('Should I avoid nuts and seeds?'), 1);
+		recomputeParentProgress(GAP_HEADINGS, progress);
+		expect(progress).not.toContain('Fiber and Disease');
+	});
+
+	test('does NOT auto-complete parent with hasOwnContent', () => {
+		const progress = ['Soluble fiber', 'Insoluble fiber'];
+		recomputeParentProgress(OWN_CONTENT_HEADINGS, progress);
+		expect(progress).not.toContain('Types of Fiber');
+	});
+
+	test('does not remove hasOwnContent parent even if children incomplete', () => {
+		const progress = ['Types of Fiber', 'Soluble fiber'];
+		recomputeParentProgress(OWN_CONTENT_HEADINGS, progress);
+		expect(progress).toContain('Types of Fiber'); // independent, not removed
+	});
+
+	test('empty progress stays empty', () => {
+		const progress: string[] = [];
+		recomputeParentProgress(HEADINGS, progress);
+		expect(progress).toEqual([]);
+	});
+
+	test('empty headings is a no-op', () => {
+		const progress = ['Something'];
+		recomputeParentProgress([], progress);
+		expect(progress).toEqual(['Something']);
+	});
+
+	test('mixed: pure parent auto-derives, hasOwnContent does not', () => {
+		// Complete all children of both parents
+		const progress = ['History', 'Modern era', 'Architecture', 'Implementation'];
+		recomputeParentProgress(MIXED_HEADINGS, progress);
+		expect(progress).not.toContain('Overview'); // hasOwnContent — not auto-derived
+		expect(progress).toContain('Technical details'); // pure parent — auto-derives
+	});
+
+	test('deep hasOwnContent: skips recompute at multiple levels', () => {
+		const progress = ['Verification', 'Execution', 'Garbage collection'];
+		recomputeParentProgress(DEEP_OWN_CONTENT, progress);
+		// Bytecode has hasOwnContent — not auto-completed even though h4s are done
+		expect(progress).not.toContain('Bytecode');
+		// JVM has hasOwnContent — not auto-completed
+		expect(progress).not.toContain('JVM');
+	});
 });
 
+// ── toggleHeadingProgress ─────────────────────────────────────
+
 describe('toggleHeadingProgress', () => {
+	// ── Basic leaf toggle ──
+
 	test('toggling a leaf child on', () => {
 		const progress: string[] = [];
 		toggleHeadingProgress(HEADINGS, progress, 'Work habits');
 		expect(progress).toContain('Work habits');
 		expect(progress).not.toContain('Personality');
+	});
+
+	test('toggling a leaf child off', () => {
+		const progress = ['Work habits'];
+		toggleHeadingProgress(HEADINGS, progress, 'Work habits');
+		expect(progress).not.toContain('Work habits');
 	});
 
 	test('toggling last child auto-completes parent', () => {
@@ -178,6 +369,17 @@ describe('toggleHeadingProgress', () => {
 		expect(progress).not.toContain('Personality');
 	});
 
+	test('toggling childless h2 works as a simple toggle', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(HEADINGS, progress, 'Legacy');
+		expect(progress).toContain('Legacy');
+
+		toggleHeadingProgress(HEADINGS, progress, 'Legacy');
+		expect(progress).not.toContain('Legacy');
+	});
+
+	// ── Pure parent cascade ──
+
 	test('toggling parent on checks all descendants', () => {
 		const progress: string[] = [];
 		toggleHeadingProgress(HEADINGS, progress, 'Personality');
@@ -192,9 +394,6 @@ describe('toggleHeadingProgress', () => {
 		const progress = ['Work habits', 'Mathematical range', 'Preferred problem-solving techniques', 'Lecture style', 'Personality'];
 		toggleHeadingProgress(HEADINGS, progress, 'Personality');
 		expect(progress).not.toContain('Work habits');
-		expect(progress).not.toContain('Mathematical range');
-		expect(progress).not.toContain('Preferred problem-solving techniques');
-		expect(progress).not.toContain('Lecture style');
 		expect(progress).not.toContain('Personality');
 	});
 
@@ -205,20 +404,9 @@ describe('toggleHeadingProgress', () => {
 		expect(progress).not.toContain('Work habits');
 	});
 
-	test('toggling childless h2 works as a simple toggle', () => {
-		const progress: string[] = [];
-		toggleHeadingProgress(HEADINGS, progress, 'Legacy');
-		expect(progress).toContain('Legacy');
-
-		toggleHeadingProgress(HEADINGS, progress, 'Legacy');
-		expect(progress).not.toContain('Legacy');
-	});
-
 	test('partial children + toggle parent on fills remaining', () => {
 		const progress = ['Work habits', 'Mathematical range'];
 		toggleHeadingProgress(HEADINGS, progress, 'Personality');
-		expect(progress).toContain('Work habits');
-		expect(progress).toContain('Mathematical range');
 		expect(progress).toContain('Preferred problem-solving techniques');
 		expect(progress).toContain('Lecture style');
 		expect(progress).toContain('Personality');
@@ -230,7 +418,8 @@ describe('toggleHeadingProgress', () => {
 		expect(progress.some(p => normaliseHeading(p) === 'Work habits')).toBe(true);
 	});
 
-	// Deep hierarchy tests
+	// ── Deep hierarchy ──
+
 	test('toggling h2 checks entire subtree (h3s and h4s)', () => {
 		const progress: string[] = [];
 		toggleHeadingProgress(DEEP_HEADINGS, progress, 'The Boys Series');
@@ -240,8 +429,6 @@ describe('toggleHeadingProgress', () => {
 		expect(progress).toContain('Season 1');
 		expect(progress).toContain('Season 2');
 		expect(progress).toContain('Lamplighter takes a stand');
-		expect(progress).toContain('Suicide in Vought Tower');
-		expect(progress).toContain('Legacy');
 		expect(progress).toContain('The Boys Series');
 	});
 
@@ -251,38 +438,37 @@ describe('toggleHeadingProgress', () => {
 		expect(progress).toContain('Childhood');
 		expect(progress).toContain('Hero Career');
 		expect(progress).toContain('Background');
-		expect(progress).not.toContain('The Boys Series'); // other h3s not done
+		expect(progress).not.toContain('The Boys Series');
 	});
 
 	test('completing all h3 subtrees auto-completes h2', () => {
 		const progress: string[] = [];
-		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Background'); // checks Childhood, Hero Career, Background
-		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Season 1');   // leaf h3
-		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Season 2');   // checks h4s + Season 2
+		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Background');
+		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Season 1');
+		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Season 2');
 		expect(progress).toContain('The Boys Series');
 	});
 
 	test('toggling h4 leaf recomputes h3 parent', () => {
 		const progress = ['Childhood'];
 		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Hero Career');
-		expect(progress).toContain('Background'); // both h4s done
+		expect(progress).toContain('Background');
 	});
 
 	test('unchecking one h4 removes h3 and h2', () => {
-		// Start fully completed
 		const progress: string[] = [];
 		toggleHeadingProgress(DEEP_HEADINGS, progress, 'The Boys Series');
 		expect(progress).toContain('The Boys Series');
 
-		// Uncheck one h4
 		toggleHeadingProgress(DEEP_HEADINGS, progress, 'Childhood');
 		expect(progress).not.toContain('Childhood');
-		expect(progress).not.toContain('Background');      // child missing
-		expect(progress).not.toContain('The Boys Series'); // h3 missing
+		expect(progress).not.toContain('Background');
+		expect(progress).not.toContain('The Boys Series');
 	});
 
+	// ── Level gap ──
+
 	test('clicking parent when all descendants already checked works', () => {
-		// Simulate: child was checked, parent wasn't auto-completed (e.g. loaded from storage)
 		const progress = ['Further defining fiber'];
 		toggleHeadingProgress(GAP_HEADINGS, progress, 'Types of Fiber');
 		expect(progress).toContain('Types of Fiber');
@@ -295,22 +481,29 @@ describe('toggleHeadingProgress', () => {
 		expect(progress).not.toContain('Types of Fiber');
 		expect(progress).not.toContain('Further defining fiber');
 	});
-});
 
-// Parent headings with own content — independent checkboxes
-const OWN_CONTENT_HEADINGS: HeadingInfo[] = [
-	{ text: 'Types of Fiber', level: 2, hasOwnContent: true },
-	{ text: 'Soluble fiber', level: 3 },
-	{ text: 'Insoluble fiber', level: 3 },
-	{ text: 'Benefits', level: 2 },
-];
-
-describe('hasOwnContent parents (independent checkboxes)', () => {
-	test('recompute does NOT auto-complete parent with hasOwnContent', () => {
-		const progress = ['Soluble fiber', 'Insoluble fiber'];
-		recomputeParentProgress(OWN_CONTENT_HEADINGS, progress);
-		expect(progress).not.toContain('Types of Fiber');
+	test('toggling h2 checks h4 descendant despite gap', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(GAP_HEADINGS, progress, 'Fiber and Disease');
+		expect(progress).toContain('Should I avoid nuts and seeds?');
+		expect(progress).toContain('Fiber and Disease');
 	});
+
+	test('toggling h4 leaf auto-completes h2 parent despite gap', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(GAP_HEADINGS, progress, 'Should I avoid nuts and seeds?');
+		expect(progress).toContain('Fiber and Disease');
+	});
+
+	test('unchecking h2 removes h4 despite gap', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(GAP_HEADINGS, progress, 'Fiber and Disease');
+		toggleHeadingProgress(GAP_HEADINGS, progress, 'Fiber and Disease');
+		expect(progress).not.toContain('Fiber and Disease');
+		expect(progress).not.toContain('Should I avoid nuts and seeds?');
+	});
+
+	// ── hasOwnContent ──
 
 	test('toggling parent with hasOwnContent does NOT cascade to children', () => {
 		const progress: string[] = [];
@@ -333,59 +526,132 @@ describe('hasOwnContent parents (independent checkboxes)', () => {
 		toggleHeadingProgress(OWN_CONTENT_HEADINGS, progress, 'Insoluble fiber');
 		expect(progress).toContain('Soluble fiber');
 		expect(progress).toContain('Insoluble fiber');
-		// Parent stays as-is (was already checked, not auto-derived)
-		expect(progress).toContain('Types of Fiber');
+		expect(progress).toContain('Types of Fiber'); // stays — not auto-derived
 	});
 
 	test('parent without hasOwnContent still auto-derives', () => {
-		// Benefits has no children and no hasOwnContent — works as leaf
 		const progress: string[] = [];
 		toggleHeadingProgress(OWN_CONTENT_HEADINGS, progress, 'Benefits');
 		expect(progress).toContain('Benefits');
 	});
-});
 
-describe('level-gap headings (h2 → h4)', () => {
-	test('getDescendants finds h4 under h2 despite level gap', () => {
-		const descendants = getDescendants(GAP_HEADINGS, 2); // Fiber and Disease
-		expect(descendants).toContain('Should I avoid nuts and seeds?');
-	});
+	// ── Mixed hasOwnContent and pure parents ──
 
-	test('recompute auto-completes parent with level gap', () => {
-		const progress = ['Should I avoid nuts and seeds?'];
-		recomputeParentProgress(GAP_HEADINGS, progress);
-		expect(progress).toContain('Fiber and Disease');
-	});
-
-	test('recompute removes parent when level-gap child is unchecked', () => {
-		const progress = ['Fiber and Disease', 'Should I avoid nuts and seeds?'];
-		// Remove the child
-		progress.splice(progress.indexOf('Should I avoid nuts and seeds?'), 1);
-		recomputeParentProgress(GAP_HEADINGS, progress);
-		expect(progress).not.toContain('Fiber and Disease');
-	});
-
-	test('toggling h2 checks h4 descendant despite gap', () => {
+	test('mixed: hasOwnContent parent toggles independently', () => {
 		const progress: string[] = [];
-		toggleHeadingProgress(GAP_HEADINGS, progress, 'Fiber and Disease');
-		expect(progress).toContain('Should I avoid nuts and seeds?');
-		expect(progress).toContain('Fiber and Disease');
+		toggleHeadingProgress(MIXED_HEADINGS, progress, 'Overview');
+		expect(progress).toContain('Overview');
+		expect(progress).not.toContain('History');
+		expect(progress).not.toContain('Modern era');
 	});
 
-	test('toggling h4 leaf auto-completes h2 parent despite gap', () => {
+	test('mixed: pure parent cascades to children', () => {
 		const progress: string[] = [];
-		toggleHeadingProgress(GAP_HEADINGS, progress, 'Should I avoid nuts and seeds?');
-		expect(progress).toContain('Should I avoid nuts and seeds?');
-		expect(progress).toContain('Fiber and Disease');
+		toggleHeadingProgress(MIXED_HEADINGS, progress, 'Technical details');
+		expect(progress).toContain('Technical details');
+		expect(progress).toContain('Architecture');
+		expect(progress).toContain('Implementation');
 	});
 
-	test('unchecking h2 removes h4 despite gap', () => {
+	test('mixed: completing children of pure parent auto-completes it', () => {
 		const progress: string[] = [];
-		toggleHeadingProgress(GAP_HEADINGS, progress, 'Fiber and Disease');
-		expect(progress).toContain('Fiber and Disease');
+		toggleHeadingProgress(MIXED_HEADINGS, progress, 'Architecture');
+		toggleHeadingProgress(MIXED_HEADINGS, progress, 'Implementation');
+		expect(progress).toContain('Technical details');
+	});
 
-		toggleHeadingProgress(GAP_HEADINGS, progress, 'Fiber and Disease');
-		expect(progress).not.toContain('Fiber and Disease');
-		expect(progress).not.toContain('Should I avoid nuts and seeds?');
+	test('mixed: completing children of hasOwnContent parent does NOT auto-complete it', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(MIXED_HEADINGS, progress, 'History');
+		toggleHeadingProgress(MIXED_HEADINGS, progress, 'Modern era');
+		expect(progress).not.toContain('Overview');
+	});
+
+	// ── Deep hasOwnContent ──
+
+	test('deep: hasOwnContent at h2 and h3 both toggle independently', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(DEEP_OWN_CONTENT, progress, 'JVM');
+		expect(progress).toEqual(['JVM']);
+
+		toggleHeadingProgress(DEEP_OWN_CONTENT, progress, 'Bytecode');
+		expect(progress).toContain('JVM');
+		expect(progress).toContain('Bytecode');
+		expect(progress).not.toContain('Verification');
+	});
+
+	test('deep: completing h4 leaves under hasOwnContent h3 does not auto-complete h3', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(DEEP_OWN_CONTENT, progress, 'Verification');
+		toggleHeadingProgress(DEEP_OWN_CONTENT, progress, 'Execution');
+		expect(progress).toContain('Verification');
+		expect(progress).toContain('Execution');
+		expect(progress).not.toContain('Bytecode'); // hasOwnContent
+		expect(progress).not.toContain('JVM');       // hasOwnContent
+	});
+
+	// ── Edge cases ──
+
+	test('toggling unknown heading is a no-op with recompute', () => {
+		const progress = ['Work habits'];
+		toggleHeadingProgress(HEADINGS, progress, 'Nonexistent heading');
+		// The unknown heading gets added as a leaf toggle
+		expect(progress).toContain('Nonexistent heading');
+		// Existing progress unchanged
+		expect(progress).toContain('Work habits');
+	});
+
+	test('toggling with empty heading list', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress([], progress, 'Something');
+		expect(progress).toContain('Something');
+	});
+
+	test('double toggle returns to original state', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(HEADINGS, progress, 'Legacy');
+		toggleHeadingProgress(HEADINGS, progress, 'Legacy');
+		expect(progress).toEqual([]);
+	});
+
+	test('double toggle on parent returns to original state', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(HEADINGS, progress, 'Personality');
+		const afterCheck = [...progress];
+		expect(afterCheck.length).toBeGreaterThan(0);
+
+		toggleHeadingProgress(HEADINGS, progress, 'Personality');
+		expect(progress).toEqual([]);
+	});
+
+	test('completing all sections in flat structure', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(FLAT_HEADINGS, progress, 'Section A');
+		toggleHeadingProgress(FLAT_HEADINGS, progress, 'Section B');
+		toggleHeadingProgress(FLAT_HEADINGS, progress, 'Section C');
+		expect(progress).toContain('Section A');
+		expect(progress).toContain('Section B');
+		expect(progress).toContain('Section C');
+	});
+
+	test('no duplicate entries after multiple toggles', () => {
+		const progress: string[] = [];
+		toggleHeadingProgress(HEADINGS, progress, 'Personality');
+		// All children + parent should be added once
+		const counts = new Map<string, number>();
+		for (const p of progress) {
+			const n = normaliseHeading(p);
+			counts.set(n, (counts.get(n) || 0) + 1);
+		}
+		for (const [, count] of counts) {
+			expect(count).toBe(1);
+		}
+	});
+
+	test('progress array is mutated in-place', () => {
+		const progress: string[] = [];
+		const returned = toggleHeadingProgress(HEADINGS, progress, 'Legacy');
+		expect(returned).toBe(progress);
+		expect(progress).toContain('Legacy');
 	});
 });
