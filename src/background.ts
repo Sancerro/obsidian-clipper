@@ -413,60 +413,73 @@ browser.runtime.onMessage.addListener((request: unknown, sender: browser.Runtime
 
 		if (typedRequest.action === 'pluginFetch') {
 			const { url, method, body, timeoutMs } = typedRequest as any;
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), typeof timeoutMs === 'number' ? timeoutMs : 5000);
 			const isLocalPluginUrl = typeof url === 'string'
 				&& (url.startsWith('http://localhost:27124') || url.startsWith('http://127.0.0.1:27124'));
+			const maxRetries = isLocalPluginUrl ? 2 : 0;
+			const retryDelay = 600; // ms
 
-			fetch(url, {
-				method: method || 'GET',
-				headers: body ? { 'Content-Type': 'application/json' } : undefined,
-				body: body ? JSON.stringify(body) : undefined,
-				signal: controller.signal,
-			}).then(async res => {
-				clearTimeout(timer);
-				const text = await res.text();
-				let data;
-				try { data = JSON.parse(text); } catch { data = text; }
+			const doFetch = (attempt: number) => {
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), typeof timeoutMs === 'number' ? timeoutMs : 5000);
 
-				let error: string | undefined;
-				if (!res.ok) {
-					if (typeof data === 'string' && data.trim()) {
-						error = data.trim();
-					} else if (data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string') {
-						error = (data as { error: string }).error;
-					} else {
-						error = res.statusText || `HTTP ${res.status}`;
+				fetch(url, {
+					method: method || 'GET',
+					headers: body ? { 'Content-Type': 'application/json' } : undefined,
+					body: body ? JSON.stringify(body) : undefined,
+					signal: controller.signal,
+				}).then(async res => {
+					clearTimeout(timer);
+					const text = await res.text();
+					let data;
+					try { data = JSON.parse(text); } catch { data = text; }
+
+					let error: string | undefined;
+					if (!res.ok) {
+						if (typeof data === 'string' && data.trim()) {
+							error = data.trim();
+						} else if (data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string') {
+							error = (data as { error: string }).error;
+						} else {
+							error = res.statusText || `HTTP ${res.status}`;
+						}
 					}
-				}
 
-				sendResponse({
-					ok: res.ok,
-					status: res.status,
-					statusText: res.statusText,
-					data,
-					error,
-					errorType: res.ok ? undefined : 'http',
-				});
-			}).catch(err => {
-				clearTimeout(timer);
-				if (err instanceof DOMException && err.name === 'AbortError') {
+					sendResponse({
+						ok: res.ok,
+						status: res.status,
+						statusText: res.statusText,
+						data,
+						error,
+						errorType: res.ok ? undefined : 'http',
+					});
+				}).catch(err => {
+					clearTimeout(timer);
+					if (err instanceof DOMException && err.name === 'AbortError') {
+						sendResponse({
+							ok: false,
+							status: 0,
+							error: 'Request timed out',
+							errorType: 'timeout',
+						});
+						return;
+					}
+
+					// Retry on connection errors for local plugin
+					if (attempt < maxRetries) {
+						setTimeout(() => doFetch(attempt + 1), retryDelay);
+						return;
+					}
+
 					sendResponse({
 						ok: false,
 						status: 0,
-						error: 'Request timed out',
-						errorType: 'timeout',
+						error: err instanceof Error ? err.message : String(err),
+						errorType: isLocalPluginUrl ? 'offline' : 'network',
 					});
-					return;
-				}
-
-				sendResponse({
-					ok: false,
-					status: 0,
-					error: err instanceof Error ? err.message : String(err),
-					errorType: isLocalPluginUrl ? 'offline' : 'network',
 				});
-			});
+			};
+
+			doFetch(0);
 			return true;
 		}
 

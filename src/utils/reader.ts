@@ -1237,6 +1237,9 @@ export class Reader {
 					});
 					item?.classList.add('active');
 
+					// Scroll outline so the active item is visible
+					item?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
 					outlineItems.forEach((outlineItem: HTMLElement, itemHeading: Element) => {
 						// Title is always visible, never faint
 						if (outlineItem.hasAttribute('data-title')) return;
