@@ -7,7 +7,7 @@
       "dependencies": {
         "@types/safari-extension": "^0.0.33",
         "dayjs": "^1.11.13",
-        "defuddle": "file:../defuddle",
+        "defuddle": "file:packages/defuddle",
         "dompurify": "^3.0.9",
         "highlight.js": "^11.11.1",
         "linkedom": "^0.18.0",
@@ -398,7 +398,7 @@
 
     "deep-eql": ["deep-eql@5.0.2", "", {}, "sha512-h5k/5U50IJJFpzfL6nO9jaaumfjO/f2NjK/oYB2Djzm4p9L+3T9qWpZqZ2hAbLPuuYq9wrU08WQyBTL5GbPk5Q=="],
 
-    "defuddle": ["defuddle@file:../defuddle", { "dependencies": { "commander": "^12.1.0" }, "devDependencies": { "@types/jsdom": "^21.1.6", "@types/node": "^20.19.0", "@types/turndown": "^5.0.5", "concurrently": "^8.2.2", "jsdom": "^24.0.0", "terser-webpack-plugin": "^5.3.14", "ts-loader": "^9.5.1", "typescript": "^5.3.3", "undici-types": "^5.0.0", "vitest": "^3.2.4", "webpack": "^5.90.3", "webpack-cli": "^5.1.4" }, "optionalDependencies": { "linkedom": "^0.18.12", "mathml-to-latex": "^1.5.0", "temml": "^0.13.1", "turndown": "^7.2.0" }, "bin": { "defuddle": "dist/cli.js" } }],
+    "defuddle": ["defuddle@file:packages/defuddle", { "dependencies": { "commander": "^12.1.0" }, "devDependencies": { "@types/jsdom": "^21.1.6", "@types/node": "^20.19.0", "@types/turndown": "^5.0.5", "concurrently": "^8.2.2", "jsdom": "^24.0.0", "terser-webpack-plugin": "^5.3.14", "ts-loader": "^9.5.1", "typescript": "^5.3.3", "undici-types": "^5.0.0", "vitest": "^3.2.4", "webpack": "^5.90.3", "webpack-cli": "^5.1.4" }, "optionalDependencies": { "linkedom": "^0.18.12", "mathml-to-latex": "^1.5.0", "temml": "^0.13.1", "turndown": "^7.2.0" }, "bin": { "defuddle": "dist/cli.js" } }],
 
     "delayed-stream": ["delayed-stream@1.0.0", "", {}, "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ=="],
 
