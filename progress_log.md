@@ -915,3 +915,43 @@ Codex identified responsibility and coupling issues. Refactored:
   - centering
   - handling multiple proof trees in one display block
   - deciding whether to keep using MathJax output directly or decorate it
+
+## 2026-04-16 (session 7)
+
+### Goal
+Visual improvements to reader mode outline sections progress bar.
+
+### Change: Progress bar styling
+- The "X/Y sections" header already had a progress bar (`.reader-progress-bar` + `.reader-progress-bar-fill`) that fills based on completed sections ratio.
+- Updated styling in `src/reader.scss` to make it more visually distinct as a loading bar:
+  - Increased height from 2px to 3px
+  - Updated border-radius to 2px for rounder appearance
+  - Kept track color as `--background-modifier-border` (subtle)
+  - Fill color remains `--interactive-accent` with 0.3s ease transition
+- The progress logic in `src/utils/reader.ts` (`computeProgressWidth`, `applyOutlineProgressState`) was already correct — fill width updates when sections are toggled.
+
+### Bug: ARIA role-based tables not parsed (GitBook)
+- Page: https://mostly-adequate.gitbook.io/mostly-adequate-guide/ch03
+- Symptom: Table with Input/Output columns renders as flat text in reader mode
+- Root cause: GitBook uses `<div role="table">`, `<div role="row">`, `<div role="cell">`, `<div role="columnheader">` instead of semantic HTML `<table>/<tr>/<td>/<th>` tags. Defuddle only recognized semantic table elements.
+- Additional complexity: GitBook puts the header `<div role="rowgroup">` (with columnheaders) as a sibling OUTSIDE the `<div role="table">`, not inside it.
+- Fix: Added ARIA role-based table conversion in `packages/defuddle/src/standardize.ts` (before the existing layout-table unwrapping logic). Converts `[role="table"]` → `<table>`, `[role="row"]` → `<tr>`, `[role="cell"]` → `<td>`, `[role="columnheader"]` → `<th>`, etc.
+- Gotcha: `:scope >` selector doesn't work in linkedom; used `parent.children` with manual filtering instead. Also `:has()` is questionable in linkedom.
+- Verified: Local defuddle build correctly outputs markdown table `| Input | Output |` etc.
+
+### Feature: Keep reader mode when following links
+- Requirement: Clicking a link inside reader mode content should open the target page in reader mode
+- Implementation:
+  - `src/utils/reader.ts` — `interceptReaderLinks()`: click handler on `<article>` intercepts `<a>` clicks, prevents default, sends `openInReaderMode` message to background
+  - Skips footnote links (handled by footnote popover system)
+  - Skips `#` anchors and `javascript:` hrefs
+  - `src/background.ts` — handles `openInReaderMode` action: stores tab ID in `pendingReaderTabs` Set, navigates tab to URL via `browser.tabs.update()`
+  - `tabs.onUpdated` listener: when tab finishes loading (`status: 'complete'`) and is in `pendingReaderTabs`, injects reader script and activates reader mode
+  - Added `url` to the typed request interface
+
+### Bug: Decorative SVG icons in links cause large whitespace
+- Page: https://mostly-adequate.gitbook.io/mostly-adequate-guide/ch04
+- Symptom: Links like "Read more about regular expressions" have huge whitespace gaps in reader mode
+- Root cause: GitBook injects inline SVG "arrow-up-right" icons inside `<a>` tags. These SVGs use `<rect width="100%" height="100%">` which, without GitBook's Tailwind CSS `size-3` constraint, expand to fill the container width/height.
+- Fix: Added SVG removal step in `packages/defuddle/src/standardize.ts` — removes `<svg>` elements inside `<a>` tags when the link also has text content (preserves SVG-only links like logo icons).
+- Verified: defuddle output now has clean `<a>` tags without SVG artifacts.

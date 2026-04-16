@@ -1197,6 +1197,82 @@ function standardizeElements(element: Element, doc: Document, subProfile?: Recor
 		}
 	});
 
+	// Remove decorative SVG icons inside links (e.g. external link arrows)
+	// These often lack size constraints and expand to fill the parent, causing layout issues
+	const linkSvgs = Array.from(element.querySelectorAll('a svg'));
+	linkSvgs.forEach(svg => {
+		const link = svg.closest('a');
+		if (!link) return;
+		// Only remove if the link has text content besides the SVG
+		const textContent = link.textContent?.trim();
+		if (textContent && textContent.length > 0) {
+			svg.remove();
+			processedCount++;
+		}
+	});
+
+	// Convert ARIA role-based tables (div[role="table"]) to semantic HTML tables
+	const roleTables = Array.from(element.querySelectorAll('[role="table"]'));
+	roleTables.forEach(roleTable => {
+		if (!roleTable.parentNode) return;
+
+		const table = doc.createElement('table');
+
+		// Check for columnheaders in sibling rowgroups (GitBook puts headers outside role="table")
+		const parent = roleTable.parentElement;
+		let headerGroup: Element | null = null;
+		if (parent) {
+			const siblings = Array.from(parent.children);
+			headerGroup = siblings.find(el =>
+				el !== roleTable &&
+				el.getAttribute('role') === 'rowgroup' &&
+				el.querySelector('[role="columnheader"]') !== null
+			) || null;
+		}
+
+		// Build thead from columnheaders (may be inside or outside the role="table" element)
+		const columnHeaders = headerGroup
+			? Array.from(headerGroup.querySelectorAll('[role="columnheader"]'))
+			: Array.from(roleTable.querySelectorAll('[role="columnheader"]'));
+		if (columnHeaders.length > 0) {
+			const thead = doc.createElement('thead');
+			const tr = doc.createElement('tr');
+			columnHeaders.forEach(header => {
+				const th = doc.createElement('th');
+				th.innerHTML = header.innerHTML;
+				tr.appendChild(th);
+			});
+			thead.appendChild(tr);
+			table.appendChild(thead);
+		}
+
+		// Build tbody from rows with cells
+		const rows = Array.from(roleTable.querySelectorAll('[role="row"]'));
+		if (rows.length > 0) {
+			const tbody = doc.createElement('tbody');
+			rows.forEach(row => {
+				// Skip rows that only contain columnheaders (already handled in thead)
+				const cells = Array.from(row.querySelectorAll('[role="cell"]'));
+				if (cells.length === 0) return;
+				const tr = doc.createElement('tr');
+				cells.forEach(cell => {
+					const td = doc.createElement('td');
+					td.innerHTML = cell.innerHTML;
+					tr.appendChild(td);
+				});
+				tbody.appendChild(tr);
+			});
+			table.appendChild(tbody);
+		}
+
+		// Remove the separate header group sibling if it exists
+		if (headerGroup) {
+			headerGroup.remove();
+		}
+		roleTable.replaceWith(table);
+		processedCount++;
+	});
+
 	// Unwrap single-column layout tables (used for styling/positioning, not data)
 	const tables = Array.from(element.querySelectorAll('table'));
 	tables.forEach(table => {

@@ -6,6 +6,9 @@ import { debounce } from './utils/debounce';
 
 const YOUTUBE_EMBED_RULE_ID = 9001;
 
+// Tabs that should auto-activate reader mode on next page load
+const pendingReaderTabs = new Set<number>();
+
 // ── Highlight SSE management ─────────────────────────────
 // Background holds EventSource connections (bypasses page CSP) and forwards
 // highlight-changed events to content scripts via long-lived ports.
@@ -399,7 +402,7 @@ async function sendMessageToPopup(tabId: number, message: any): Promise<void> {
 
 browser.runtime.onMessage.addListener((request: unknown, sender: browser.Runtime.MessageSender, sendResponse: (response?: any) => void): true | undefined => {
 	if (typeof request === 'object' && request !== null) {
-		const typedRequest = request as { action: string; isActive?: boolean; hasHighlights?: boolean; tabId?: number; text?: string; section?: string };
+		const typedRequest = request as { action: string; isActive?: boolean; hasHighlights?: boolean; tabId?: number; text?: string; section?: string; url?: string };
 		
 		if (typedRequest.action === 'saveReaderSettings') {
 			const { settings } = typedRequest as any;
@@ -653,6 +656,16 @@ browser.runtime.onMessage.addListener((request: unknown, sender: browser.Runtime
 					.then(sendResponse);
 			});
 			return true;
+		}
+
+		if (typedRequest.action === "openInReaderMode" && typedRequest.url) {
+			const tabId = sender.tab?.id;
+			if (tabId) {
+				pendingReaderTabs.add(tabId);
+				browser.tabs.update(tabId, { url: typedRequest.url });
+			}
+			sendResponse({ success: true });
+			return;
 		}
 
 		if (typedRequest.action === "getActiveTabAndToggleIframe") {
@@ -1000,6 +1013,20 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
 
 browser.runtime.onInstalled.addListener(() => {
 	debouncedUpdateContextMenu(-1); // Use a dummy tabId for initial creation
+});
+
+// Auto-activate reader mode on tabs that were navigated via reader mode links
+browser.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+	if (changeInfo.status === 'complete' && pendingReaderTabs.has(tabId)) {
+		pendingReaderTabs.delete(tabId);
+		try {
+			await ensureContentScriptLoadedInBackground(tabId);
+			await injectReaderScript(tabId);
+			await browser.tabs.sendMessage(tabId, { action: "toggleReaderMode" });
+		} catch (error) {
+			console.error('Error activating reader mode after navigation:', error);
+		}
+	}
 });
 
 async function isSidePanelOpen(windowId: number): Promise<boolean> {

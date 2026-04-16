@@ -1909,6 +1909,30 @@ export class Reader {
 		}
 	}
 
+	private static interceptReaderLinks(doc: Document): void {
+		const article = doc.querySelector('article');
+		if (!article) return;
+
+		article.addEventListener('click', (e) => {
+			const link = (e.target as Element)?.closest?.('a[href]') as HTMLAnchorElement | null;
+			if (!link) return;
+
+			const href = link.href;
+			if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+
+			// Don't intercept footnote links (handled separately)
+			if (link.closest('.footnote-ref, .footnote-backref, [role="doc-noteref"], [role="doc-backlink"]')) return;
+
+			e.preventDefault();
+			e.stopPropagation();
+
+			browser.runtime.sendMessage({
+				action: 'openInReaderMode',
+				url: href,
+			});
+		});
+	}
+
 	private static initializeComments(doc: Document) {
 		const commentsEl = doc.querySelector<HTMLElement>('.comments');
 		if (!commentsEl) return;
@@ -2894,6 +2918,7 @@ export class Reader {
 		this.initializeLightbox(doc);
 		this.linkifyTextUrls(doc);
 		this.initializeComments(doc);
+		this.interceptReaderLinks(doc);
 		await this.renderMath(doc);
 	}
 
