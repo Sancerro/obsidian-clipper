@@ -473,7 +473,10 @@ function stripUnwantedAttributes(element: Element, debug: boolean): void {
 				)) ||
 				// Preserve class and title attributes inside code blocks for
 				// syntax highlighting (e.g. coqdoc <span class="id" title="keyword">)
-				(isInCodeBlock && (attrName === 'class' || attrName === 'title'))
+				(isInCodeBlock && (attrName === 'class' || attrName === 'title')) ||
+				// Preserve style in code blocks only if it contains color/font properties
+				// (Shiki <span style="color:...">); strip layout-affecting styles
+				(isInCodeBlock && attrName === 'style' && /\bcolor\b|font-style|font-weight|text-decoration/.test(attrValue))
 			) {
 				return;
 			}

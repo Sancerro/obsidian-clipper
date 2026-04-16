@@ -1434,6 +1434,42 @@ export class Reader {
 
 	private static readonly INTRO_SECTION_LABEL = 'Introduction';
 
+	private static scrollToFirstUncompleted(doc: Document): void {
+		if (this.readingProgress.length === 0) return;
+
+		const infos = this.getArticleHeadingInfos(doc);
+		if (infos.length === 0) return;
+
+		const article = doc.querySelector('article');
+		if (!article) return;
+
+		const headings = Array.from(article.querySelectorAll('h2, h3, h4, h5, h6'))
+			.filter(h => !h.closest('blockquote'));
+
+		// Find first uncompleted section that has a real DOM target
+		for (const info of infos) {
+			if (this.readingProgress.some(p => normaliseHeading(p) === normaliseHeading(info.text))) continue;
+
+			// Synthetic Introduction → scroll to top
+			if (info.text === this.INTRO_SECTION_LABEL) {
+				requestAnimationFrame(() => {
+					doc.querySelector('.obsidian-reader-content')?.scrollTo({ top: 0, behavior: 'smooth' });
+				});
+				return;
+			}
+
+			const target = headings.find(h =>
+				normaliseHeading(h.textContent || '') === normaliseHeading(info.text)
+			);
+			if (target) {
+				requestAnimationFrame(() => {
+					target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+				});
+				return;
+			}
+		}
+	}
+
 	private static getArticleHeadingInfos(doc: Document): HeadingInfo[] {
 		const article = doc.querySelector('article');
 		if (!article) return [];
@@ -1447,7 +1483,8 @@ export class Reader {
 		// Add synthetic intro entry only if no real heading already matches the label
 		const introCollides = headings.some(h => normaliseHeading(h.text) === normaliseHeading(this.INTRO_SECTION_LABEL));
 		if (this.hasIntroContent(article) && !introCollides) {
-			headings.unshift({ text: this.INTRO_SECTION_LABEL, level: 2 });
+			const introLevel = headings.length > 0 ? headings[0].level : 2;
+			headings.unshift({ text: this.INTRO_SECTION_LABEL, level: introLevel });
 		}
 		return headings;
 	}
@@ -1739,25 +1776,38 @@ export class Reader {
 		}
 	}
 
+	// Restrict auto-detection to common languages to avoid false positives
+	private static readonly HLJS_LANGUAGE_SUBSET = [
+		'javascript', 'typescript', 'python', 'ruby', 'java', 'c', 'cpp', 'csharp',
+		'go', 'rust', 'swift', 'kotlin', 'php', 'shell', 'bash', 'css', 'html',
+		'xml', 'json', 'yaml', 'sql', 'markdown', 'haskell', 'r', 'lua', 'perl',
+		'scala', 'elixir', 'clojure', 'lisp', 'scheme', 'ocaml', 'fsharp', 'dart',
+		'objectivec', 'diff',
+	];
+
 	private static initializeCodeHighlighting(doc: Document) {
 		// Find all pre > code blocks
 		const codeBlocks = doc.querySelectorAll('pre > code');
 		codeBlocks.forEach(block => {
-			// Try to detect the language from class
 			const classes = block.className.split(' ');
 			const languageClass = classes.find(c => c.startsWith('language-'));
-			const language = languageClass ? languageClass.replace('language-', '') : '';
 
-			if (language) {
+			if (languageClass) {
 				try {
 					hljs.highlightElement(block as HTMLElement);
 				} catch (e) {
 					console.log('Reader', 'Error highlighting code block:', e);
 				}
 			} else {
-				// If no language specified, try autodetection
+				// No language class — use auto-detection with curated subset
 				try {
-					hljs.highlightElement(block as HTMLElement);
+					const text = block.textContent || '';
+					const result = hljs.highlightAuto(text, this.HLJS_LANGUAGE_SUBSET);
+					if (result.language) {
+						block.classList.add(`language-${result.language}`);
+						(block as HTMLElement).innerHTML = result.value;
+						block.classList.add('hljs');
+					}
 				} catch (e) {
 					console.log('Reader', 'Error highlighting code block:', e);
 				}
@@ -2870,6 +2920,9 @@ export class Reader {
 
 			// Initialize content-dependent features
 			await this.initializeContentFeatures(doc, title);
+
+			// Scroll to first uncompleted section
+			this.scrollToFirstUncompleted(doc);
 
 			// Stop page-level sync (reader mode has its own sync)
 			stopPageHighlightSync();

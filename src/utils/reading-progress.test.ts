@@ -655,3 +655,87 @@ describe('toggleHeadingProgress', () => {
 		expect(progress).toContain('Legacy');
 	});
 });
+
+// ── Introduction level matching ──────────────────────────────
+// Tests for the fix: synthetic intro should match the first heading level,
+// not always be h2. This prevents intro from becoming an accidental parent.
+
+describe('intro section as sibling (level matching)', () => {
+	// Simulates the reader.ts fix: intro takes the level of the first heading
+	function addIntro(headings: HeadingInfo[]): HeadingInfo[] {
+		const introLevel = headings.length > 0 ? headings[0].level : 2;
+		return [{ text: 'Introduction', level: introLevel }, ...headings];
+	}
+
+	test('intro matches h4 when all headings are h4', () => {
+		const headings: HeadingInfo[] = [
+			{ text: 'Exercise 1', level: 4 },
+			{ text: 'Exercise 2', level: 4 },
+			{ text: 'Exercise 3', level: 4 },
+		];
+		const withIntro = addIntro(headings);
+		expect(withIntro[0].level).toBe(4);
+		// Intro should be a sibling, not a parent — no children in hierarchy
+		const hierarchy = buildHierarchy(withIntro);
+		const introChildren = hierarchy.get('Introduction');
+		expect(introChildren).toEqual([]);
+	});
+
+	test('intro matches h2 when first heading is h2', () => {
+		const withIntro = addIntro(HEADINGS);
+		expect(withIntro[0].level).toBe(2);
+		// Intro is a sibling of other h2 sections — no children
+		const hierarchy = buildHierarchy(withIntro);
+		const introChildren = hierarchy.get('Introduction');
+		expect(introChildren).toEqual([]);
+	});
+
+	test('intro defaults to h2 when no headings exist', () => {
+		const withIntro = addIntro([]);
+		expect(withIntro[0].level).toBe(2);
+	});
+
+	test('intro matches h3 for h3-only pages', () => {
+		const headings: HeadingInfo[] = [
+			{ text: 'Part A', level: 3 },
+			{ text: 'Part B', level: 3 },
+		];
+		const withIntro = addIntro(headings);
+		expect(withIntro[0].level).toBe(3);
+		const hierarchy = buildHierarchy(withIntro);
+		// All three should be top-level with no children
+		expect(hierarchy.get('Introduction')).toEqual([]);
+		expect(hierarchy.get('Part A')).toEqual([]);
+		expect(hierarchy.get('Part B')).toEqual([]);
+	});
+
+	test('old behavior (h2) would make intro parent of h3 headings', () => {
+		const headings: HeadingInfo[] = [
+			{ text: 'Chapter 1', level: 3 },
+			{ text: 'Chapter 2', level: 3 },
+		];
+		// Simulate old behavior: always h2
+		const oldIntro: HeadingInfo[] = [{ text: 'Introduction', level: 2 }, ...headings];
+		const hierarchy = buildHierarchy(oldIntro);
+		// Old behavior: intro at h2 is parent of h3 children
+		expect(hierarchy.get('Introduction')).toEqual(['Chapter 1', 'Chapter 2']);
+
+		// New behavior: intro matches first heading level → all siblings
+		const newIntro = addIntro(headings);
+		const newHierarchy = buildHierarchy(newIntro);
+		expect(newHierarchy.get('Introduction')).toEqual([]);
+	});
+
+	test('recomputeParentProgress works with level-matched intro', () => {
+		const headings: HeadingInfo[] = [
+			{ text: 'Exercise 1', level: 4 },
+			{ text: 'Exercise 2', level: 4 },
+			{ text: 'Exercise 3', level: 4 },
+		];
+		const withIntro = addIntro(headings);
+		const progress = ['Exercise 1', 'Exercise 2', 'Exercise 3'];
+		recomputeParentProgress(withIntro, progress);
+		// Intro is a sibling, not a parent — it should NOT auto-complete
+		expect(progress).not.toContain('Introduction');
+	});
+});

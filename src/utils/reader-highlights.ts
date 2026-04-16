@@ -712,7 +712,13 @@ export function wrapRangeInMarks(range: Range, className: string, id: string): v
 		const textNode = textNodes[i];
 		const nodeRange = document.createRange();
 		const start = textNode === range.startContainer ? range.startOffset : 0;
-		const end = textNode === range.endContainer ? range.endOffset : textNode.length;
+		let end = textNode === range.endContainer ? range.endOffset : textNode.length;
+		if (start >= end) continue;
+
+		// Trim trailing whitespace from mark boundaries to prevent
+		// the highlight stretching across empty inline space
+		const text = textNode.textContent || '';
+		while (end > start && /\s/.test(text[end - 1])) end--;
 		if (start >= end) continue;
 
 		nodeRange.setStart(textNode, start);
